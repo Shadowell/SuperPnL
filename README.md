@@ -31,6 +31,7 @@ Path Head + Alpha Head + Position Head
 | 理解回测和评测计划 | [docs/BACKTEST_AND_EVALUATION_PLAN.md](docs/BACKTEST_AND_EVALUATION_PLAN.md) |
 | 理解下游如何配置和使用模型 | [docs/DOWNSTREAM_USAGE.md](docs/DOWNSTREAM_USAGE.md) |
 | 查看 Top20 / 12 个月实验结果 | [docs/TOP20_12M_EXPERIMENT_REPORT.md](docs/TOP20_12M_EXPERIMENT_REPORT.md) |
+| 复现实验并理解 Top20 币池 | [docs/REPRODUCIBILITY_AND_TOP20_UNIVERSE.md](docs/REPRODUCIBILITY_AND_TOP20_UNIVERSE.md) |
 
 ## 核心目标
 
@@ -82,7 +83,8 @@ SuperPnL/
 │   ├── FEATURE_SCHEMA.md
 │   ├── BACKTEST_AND_EVALUATION_PLAN.md
 │   ├── DOWNSTREAM_USAGE.md
-│   └── TOP20_12M_EXPERIMENT_REPORT.md
+│   ├── TOP20_12M_EXPERIMENT_REPORT.md
+│   └── REPRODUCIBILITY_AND_TOP20_UNIVERSE.md
 ├── scripts/
 │   ├── download_okx_spot_1m.py
 │   └── run_superpnl_experiment.py
