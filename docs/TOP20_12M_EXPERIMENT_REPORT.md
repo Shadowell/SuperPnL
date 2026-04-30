@@ -67,6 +67,8 @@ threshold_bps=0
 
 本表是零成本回测，即 `fee=0bps`、`slippage=0bps`。当前阶段暂不使用盘口、成本、流动性特征。
 
+![SuperPnL 5m/15m/30m horizon comparison](charts/superpnl_horizon_comparison.png)
+
 | model | horizon | total_return | sharpe | max_drawdown | turnover | trades |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | no_trade | - | 0.0000 | 0.000 | 0.0000 | 0.0000 | 0 |

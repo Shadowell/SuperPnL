@@ -259,6 +259,16 @@ outputs/<run_name>/
 
 ## 6. 结果复现
 
+5m/15m/30m 对比图：
+
+![SuperPnL 5m/15m/30m horizon comparison](charts/superpnl_horizon_comparison.png)
+
+重新生成该图：
+
+```bash
+PYTHONPATH=src python3 scripts/plot_horizon_comparison.py
+```
+
 5m/15m 主结果：
 
 | model | horizon | total_return | sharpe | max_drawdown | turnover | trades |
