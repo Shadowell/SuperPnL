@@ -1,7 +1,7 @@
 [project]
-name = "factorbarnet"
+name = "superpnl"
 version = "0.1.0"
-description = "Factor-enhanced multi-horizon K-line forecasting for crypto spot and perpetual markets"
+description = "PnL-first prediction modeling research framework focused first on spot crypto positions"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
