@@ -2,7 +2,7 @@
 
 本文档是一份可直接复制给 BitPro 项目编码代理的策略实现提示词。
 
-目标：在 BitPro 当前 `BaseStrategy` 框架内，接入 SuperPnL 打包后的模型包，做 **实时 1min K 线推理**，输出 `pred_ret_15m`，再由策略层执行现货 long-only、低换手、含成本可评估的交易逻辑。
+目标：在 BitPro 当前 `BaseStrategy` 框架内，从 Hugging Face 拉取 `Shadowell/SuperPnL` 模型包，做 **实时 1min K 线推理**，输出 `pred_ret_15m`，再由策略层执行现货 long-only、低换手、含成本可评估的交易逻辑。
 
 注意：
 
@@ -31,13 +31,15 @@ artifacts/superpnl_full_feature_tcn_15m_top20_20260430.tar.gz
 https://huggingface.co/Shadowell/SuperPnL
 ```
 
-BitPro 下游服务推荐直接下载 Hugging Face 模型仓库：
+BitPro 下游服务可以用 CLI 预下载 Hugging Face 模型仓库：
 
 ```bash
 hf download Shadowell/SuperPnL \
   --local-dir /opt/bitpro/artifacts/superpnl \
   --exclude "*.tar.gz"
 ```
+
+但策略实现的主路径应放在服务里：启动时通过 `huggingface_hub.snapshot_download` 自动拉取或复用本地缓存。也就是说，下游不需要手工拷贝模型文件；只要能访问 Hugging Face，就能自动获得模型包。
 
 模型包内容：
 
@@ -62,10 +64,12 @@ BitPro 实现时应从模型包加载：
 - `universe.json`：SuperPnL `BTC-USDT` 和 BitPro `BTC/USDT` 的 symbol 映射。
 - `data_contract.json`：实时推理契约和防未来泄漏约束。
 
-模型包不应提交到普通 git 仓库。BitPro 可以通过本地路径、部署 artifact 目录或环境变量加载，例如：
+模型包不应提交到普通 git 仓库。BitPro 应通过 Hugging Face repo id 拉取模型，并把下载结果缓存到本地目录，例如：
 
 ```text
-SUPERPNL_MODEL_PACKAGE_DIR=/opt/bitpro/artifacts/superpnl
+SUPERPNL_MODEL_REPO_ID=Shadowell/SuperPnL
+SUPERPNL_MODEL_REVISION=main
+SUPERPNL_MODEL_CACHE_DIR=/opt/bitpro/artifacts/superpnl
 ```
 
 ## 使用方式
@@ -87,7 +91,7 @@ SUPERPNL_MODEL_PACKAGE_DIR=/opt/bitpro/artifacts/superpnl
 10. data/seed/strategies.json
 
 目标：
-基于 SuperPnL 已训练好的模型包，在 BitPro 的 `BaseStrategy` 框架里实现一个实时 1min K 线推理策略。策略每分钟使用最新确认 K 线生成和训练一致的特征，加载 `full_feature_tcn` 模型实时输出 `pred_ret_15m`，再按阈值、Top-K、最短持仓、冷却时间和再平衡间隔生成现货 long-only 目标仓位。
+基于 Hugging Face 上的 `Shadowell/SuperPnL` 模型包，在 BitPro 的 `BaseStrategy` 框架里实现一个实时 1min K 线推理策略。服务启动时自动从 Hugging Face 拉取或复用本地缓存模型包；策略每分钟使用最新确认 K 线生成和训练一致的特征，加载 `full_feature_tcn` 模型实时输出 `pred_ret_15m`，再按阈值、Top-K、最短持仓、冷却时间和再平衡间隔生成现货 long-only 目标仓位。
 
 不要重新训练模型。不要读取历史 test prediction 文件作为模拟盘或实盘信号。不要写旧函数式 `strategy(ctx)` / `setup(ctx)`。不要直接使用 Backtrader、CCXT、数据库裸调用或交易所 API。策略必须是一套 `BaseStrategy` 代码，能被 BitPro 回测、模拟盘、实盘同构运行。
 
@@ -112,10 +116,12 @@ SUPERPNL_MODEL_PACKAGE_DIR=/opt/bitpro/artifacts/superpnl
 - 当前只做 OKX spot，不做永续、不做杠杆、不做借币做空
 - 目标不是复现零成本最高收益，而是在实时模型推理基础上降低换手，让策略在含成本下仍可能可交易
 
-SuperPnL 模型包：
+SuperPnL Hugging Face 模型：
 
 ```text
-SUPERPNL_MODEL_PACKAGE_DIR=/opt/bitpro/artifacts/superpnl
+SUPERPNL_MODEL_REPO_ID=Shadowell/SuperPnL
+SUPERPNL_MODEL_REVISION=main
+SUPERPNL_MODEL_CACHE_DIR=/opt/bitpro/artifacts/superpnl
 ```
 
 模型包包含：
@@ -132,7 +138,7 @@ manifest.json
 README.md
 ```
 
-如果本地没有该模型包，请不要 mock 预测，不要生成随机信号，不要 fallback 到 momentum。应在最终说明中明确“缺少 SuperPnL 模型包，策略无法产生实时信号”。
+如果本地没有模型包，必须先尝试从 Hugging Face 下载。若 Hugging Face 下载失败、网络不可用、模型文件缺失或校验失败，请不要 mock 预测，不要生成随机信号，不要 fallback 到 momentum。应在最终说明中明确“SuperPnL Hugging Face 模型下载/加载失败，策略无法产生实时信号”。
 
 需要实现的新代码：
 
@@ -183,7 +189,10 @@ _BASE_STRATEGY_REGISTRY["superpnl_15m_low_turnover"] = SuperPnL15mLowTurnoverStr
     "horizon": "15m",
     "warmup_bars": 300,
 
-    "model_package_dir": "${SUPERPNL_MODEL_PACKAGE_DIR}",
+    "model_repo_id": "Shadowell/SuperPnL",
+    "model_revision": "main",
+    "model_cache_dir": "${SUPERPNL_MODEL_CACHE_DIR}",
+    "allow_model_download": true,
     "signal_provider": "superpnl_model_inference",
     "signal_horizon": "15m",
 
@@ -249,7 +258,13 @@ class SuperPnLSignal:
 
 
 class SuperPnLModelInferenceService:
-    async def initialize(self, model_package_dir: str) -> None:
+    async def initialize(
+        self,
+        model_repo_id: str = "Shadowell/SuperPnL",
+        model_revision: str = "main",
+        model_cache_dir: str | None = None,
+        allow_model_download: bool = True,
+    ) -> None:
         ...
 
     async def update_bar(self, bar: BarData) -> None:
@@ -269,16 +284,70 @@ class SuperPnLModelInferenceService:
 
 服务要求：
 
-- 从 `model_package_dir` 加载模型包，不从历史 prediction `.npz` 文件加载交易信号。
+- 使用 Hugging Face repo `Shadowell/SuperPnL` 作为模型来源。
+- 启动时调用 `huggingface_hub.snapshot_download` 下载或复用本地缓存模型包。
+- 如果 `model_cache_dir` 已经有完整模型文件，可以复用本地目录；如果缺失且 `allow_model_download=true`，必须自动下载。
+- 下载时排除 `*.tar.gz`，策略服务直接读取仓库根目录文件。
+- 支持 `model_revision`，默认 `main`；如果线上要固定版本，可以改成 Hugging Face commit hash。
+- 从下载后的本地模型目录加载模型包，不从历史 prediction `.npz` 文件加载交易信号。
 - 使用 `model_config.json` 实例化模型结构。
 - 使用 `model.pt` 加载权重。
 - 使用 `feature_schema.json` 的特征顺序构造输入。
 - 使用 `normalization_stats.npz` 做标准化。
 - 使用 `universe.json` 做 `BTC/USDT` 与 `BTC-USDT` 映射。
 - `symbol` 必须兼容 BitPro 的 `BTC/USDT` 和 SuperPnL 的 `BTC-USDT`。
-- 如果模型包不存在、权重加载失败、特征不足、timestamp 对不上或 symbol 不在 universe 中，返回 `None` 并输出诊断日志。
+- 如果 Hugging Face 下载失败、模型包不存在、权重加载失败、特征不足、timestamp 对不上或 symbol 不在 universe 中，返回 `None` 并输出诊断日志。
 - 不允许生成假信号。
 - 不允许 fallback 到 momentum/template/random/synthetic。
+
+下载实现建议：
+
+```python
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+REQUIRED_SUPERPNL_FILES = [
+    "model.pt",
+    "model_config.json",
+    "feature_schema.json",
+    "normalization_stats.npz",
+    "universe.json",
+    "data_contract.json",
+    "metrics_summary.json",
+    "manifest.json",
+]
+
+
+def resolve_superpnl_model_dir(
+    repo_id: str,
+    revision: str,
+    cache_dir: str | None,
+    allow_download: bool,
+) -> Path:
+    local_dir = Path(cache_dir).expanduser() if cache_dir else None
+    if local_dir and all((local_dir / name).exists() for name in REQUIRED_SUPERPNL_FILES):
+        return local_dir
+    if not allow_download:
+        raise FileNotFoundError(f"SuperPnL model files missing under {local_dir}")
+    downloaded = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        local_dir=str(local_dir) if local_dir else None,
+        ignore_patterns=["*.tar.gz"],
+    )
+    model_dir = Path(downloaded)
+    missing = [name for name in REQUIRED_SUPERPNL_FILES if not (model_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"SuperPnL model repo missing files: {missing}")
+    return model_dir
+```
+
+依赖要求：
+
+- 如果 BitPro 还没有依赖 `huggingface_hub`，请加入后端依赖文件。
+- 不要把 Hugging Face token 写进代码、配置样例或文档。
+- 当前 `Shadowell/SuperPnL` 是公开模型仓库，正常下载不需要 token；如果生产环境限流或使用私有仓库，只能通过环境变量 `HF_TOKEN` 注入。
 
 实时特征构造：
 
@@ -414,7 +483,9 @@ await self.broadcast_strategy_channel(payload)
   "rebalance_interval_bars": 15,
   "min_holding_bars": 30,
   "cooldown_bars": 30,
-  "model_package_dir": "/opt/bitpro/artifacts/superpnl_full_feature_tcn_15m_top20_20260430"
+  "model_repo_id": "Shadowell/SuperPnL",
+  "model_revision": "main",
+  "model_cache_dir": "/opt/bitpro/artifacts/superpnl"
 }
 ```
 
@@ -423,6 +494,7 @@ await self.broadcast_strategy_channel(payload)
 ```python
 DECISION_LABELS = {
     "warm_up_history": "历史K线不足，继续预热",
+    "skip_model_download_failed": "未交易：SuperPnL Hugging Face 模型下载失败",
     "skip_model_package_missing": "未交易：SuperPnL 模型包不存在",
     "skip_model_not_ready": "未交易：SuperPnL 模型尚未就绪",
     "skip_no_signal": "未交易：SuperPnL 实时信号不可用",
@@ -442,6 +514,7 @@ DECISION_LABELS = {
 禁止事项：
 
 - 不允许读取 `full_feature_tcn_test_predictions.npz` 作为模拟盘或实盘信号。
+- 不允许跳过 Hugging Face 模型下载逻辑后用本地伪造文件替代。
 - 不允许在策略类中直接加载 `model.pt`，模型加载必须封装在 service。
 - 不允许策略类直接计算复杂特征，特征构造必须封装在 feature builder。
 - 不允许为了让策略有交易而生成 mock / random / synthetic / momentum fallback 信号。
@@ -527,11 +600,12 @@ slippage_bps: [0, 1, 2]
 1. 新增 `backend/app/services/superpnl_model_inference_service.py`
 2. 新增 `backend/app/services/superpnl_feature_builder.py`
 3. 新增 `backend/app/strategies/superpnl_15m_low_turnover_strategy.py`
-4. 更新 `backend/app/services/strategy_registry.py`
-5. 更新 `data/seed/strategies.json`
-6. 更新 `docs/progress.md`
-7. 如新增配置或架构说明，更新 `docs/spec.md`
-8. 如该策略需要上线展示，说明需要执行远端 seed sync：
+4. 如后端依赖文件缺少 `huggingface_hub`，补充依赖
+5. 更新 `backend/app/services/strategy_registry.py`
+6. 更新 `data/seed/strategies.json`
+7. 更新 `docs/progress.md`
+8. 如新增配置或架构说明，更新 `docs/spec.md`
+9. 如该策略需要上线展示，说明需要执行远端 seed sync：
 
 ```bash
 export BITPRO_SEED_SSH=user@production-host
@@ -558,10 +632,10 @@ python3 -m compileall -q backend/app
 - 最终说明包含：
   - 新增文件
   - 策略 key
-  - 模型包路径和加载方式
+  - Hugging Face repo id、revision、缓存目录和加载方式
   - seed 配置
   - 如何运行回测/模拟
-  - 如何确认正在使用实时模型推理，而不是历史 prediction 文件
+  - 如何确认正在从 Hugging Face 下载/缓存模型，并使用实时模型推理，而不是历史 prediction 文件
   - 验证命令结果
   - 若生产 DB 未同步，明确待执行命令
 ````
@@ -572,6 +646,7 @@ python3 -m compileall -q backend/app
 
 - 不要重新训练 SuperPnL。
 - 不要用 `test` 调参。
+- 不要手工依赖历史预测文件；模型来源是 Hugging Face `Shadowell/SuperPnL`。
 - 不要让策略类直接读模型文件或预测文件，模型加载必须封装在 inference service。
 - 不要把历史 prediction `.npz` 当作模拟盘或实盘信号源。
 - 不要在 BitPro 策略里直接调用 OKX / CCXT / DB。
