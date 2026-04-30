@@ -2,6 +2,8 @@
 
 本文档说明 SuperPnL 第一版模型如何从数据、配置、训练结果进入下游策略使用。
 
+当前推荐下游使用 **模型包实时推理**，而不是读取历史 test prediction 文件。历史 prediction `.npz` 只适合离线回测复现和一致性测试，不能作为模拟盘或实盘信号源。
+
 ## 1. 当前默认配置
 
 | 项 | 默认值 |
@@ -111,38 +113,89 @@ outputs/superpnl_top20_365d/
 └── full_feature_tcn_test_predictions.npz
 ```
 
-## 5. 下游在线使用方式
+## 5. 模型包
+
+实时推理需要的不只是一个 `.pt` 权重文件，还必须包含模型配置、特征顺序、标准化参数和币池映射。
+
+打包命令：
+
+```bash
+PYTHONPATH=src python3 scripts/package_superpnl_model.py --force
+```
+
+当前默认输出：
+
+```text
+artifacts/superpnl_full_feature_tcn_15m_top20_20260430/
+artifacts/superpnl_full_feature_tcn_15m_top20_20260430.tar.gz
+```
+
+Hugging Face 模型仓库：
+
+```text
+https://huggingface.co/Shadowell/SuperPnL
+```
+
+下游服务推荐直接下载：
+
+```bash
+hf download Shadowell/SuperPnL \
+  --local-dir /opt/bitpro/artifacts/superpnl \
+  --exclude "*.tar.gz"
+```
+
+模型包内容：
+
+```text
+model.pt
+model_config.json
+feature_schema.json
+normalization_stats.npz
+universe.json
+data_contract.json
+metrics_summary.json
+manifest.json
+README.md
+```
+
+`artifacts/` 不提交 git。下游部署时应把模型包复制到 BitPro 的 artifact 目录，并通过配置或环境变量指定路径。
+
+## 6. 下游在线使用方式
 
 每分钟在最新 1min K 线确认后执行：
 
 1. 读取当前交易池每个 symbol 最近 `lookback=256` 根 1min K 线。
-2. 用训练时完全相同的 `feature_windows` 生成特征。
-3. 使用训练缓存中的 train 均值和标准差做标准化；不能用线上全量历史重新拟合。
-4. 加载 `full_feature_tcn.pt`，得到每个 horizon 的 `pred_ret` 和 `pos_logit`。
-5. 策略层选择 horizon，例如只用 `5m` 或在 `5m/15m` 间择优。
-6. 将 `pred_ret > threshold` 或 `sigmoid(pos_logit) > threshold` 转成目标仓位。
+2. 用模型包 `feature_schema.json` 中完全相同的 `feature_windows` 和特征顺序生成特征。
+3. 使用 `normalization_stats.npz` 中的 train 均值和标准差做标准化；不能用线上全量历史重新拟合。
+4. 加载模型包里的 `model.pt` 和 `model_config.json`，得到每个 horizon 的 `pred_ret` 和 `pos_logit`。
+5. 当前只推荐消费 `recommended_horizon=15m`，对应 `recommended_horizon_index=1`。
+6. 策略层用 `threshold/top-k/min_holding/cooldown/rebalance_interval` 把预测转成目标仓位。
 7. 执行层按现货 long-only 规则把目标仓位限制在 `0..1`。
 
 第一版推荐下游只消费两个字段：
 
 ```text
-pred_ret_5m
 pred_ret_15m
+pos_score_15m
 ```
 
-仓位规则先保持简单：
+不要直接使用逐分钟翻仓：
 
 ```text
-target_pos = 1.0 if pred_ret_h > threshold else 0.0
+target_pos = 1.0 if pred_ret_15m > 0 else 0.0
 ```
 
-后续如果要更平滑，可以改成：
+更合理的是由策略层统一处理：
 
 ```text
-target_pos = clip(pred_ret_h / target_return_scale, 0.0, 1.0)
+候选 = pred_ret_15m > threshold_bps / 10000
+排序 = 按 pred_ret_15m 降序
+选币 = top_k
+仓位 = min(max_position_per_symbol, max_total_position / top_k)
+再叠加 min_holding / cooldown / rebalance_interval
 ```
 
-## 6. 稳定性检查
+## 7. 稳定性检查
 
 正式结果至少检查：
 
