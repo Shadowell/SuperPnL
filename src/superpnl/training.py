@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -26,8 +27,25 @@ class TrainConfig:
     position_loss_weight: float = 0.15
     threshold_bps: float = 0.0
     validation_samples: int | None = 100_000
+    model_selection_metric: str = "val_rank_ic_mean"
     seed: int = 17
     device: str = "auto"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2)
+
+
+@dataclass
+class LowTurnoverConfig:
+    top_k: int = 3
+    rebalance_interval_bars: int = 15
+    min_holding_bars: int = 30
+    cooldown_bars: int = 30
+    max_position_per_symbol: float = 0.20
+    max_total_position: float = 0.60
+    max_turnover_per_step: float = 1.0
+    min_liquidity_rank: float | None = None
+    max_illiquidity_rank: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -68,6 +86,9 @@ def train_model(
     bce = nn.BCEWithLogitsLoss()
     threshold = config.threshold_bps / 10_000.0
     history = []
+    best_score = -float("inf")
+    best_state = None
+    best_record = None
     started = time.time()
     for epoch in range(1, config.epochs + 1):
         model.train()
@@ -111,9 +132,25 @@ def train_model(
             "elapsed_sec": time.time() - started,
         }
         history.append(record)
+        score = float(record.get(config.model_selection_metric, record["val_rank_ic_mean"]))
+        if score > best_score:
+            best_score = score
+            best_record = record
+            best_state = deepcopy({key: value.detach().cpu() for key, value in model.state_dict().items()})
         print(f"{name} epoch {epoch}: {record}", flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model_path = out / f"{name}.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(config), "use_features": use_features}, model_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": asdict(config),
+            "use_features": use_features,
+            "best_record": best_record,
+            "best_score": best_score,
+        },
+        model_path,
+    )
     (out / f"{name}_history.json").write_text(json.dumps(history, indent=2) + "\n")
     return model, {"history": history, "model_path": str(model_path)}
 
@@ -169,6 +206,29 @@ def evaluate_model(
     return {"horizon_metrics": horizon_metrics, "pred": pred, "true": true, "pos_score": pos_score}
 
 
+def _return_summary(returns: np.ndarray, prefix: str) -> dict[str, float]:
+    values = np.nan_to_num(returns.astype("float64"), nan=0.0)
+    return {f"{prefix}_total_return": float(np.exp(values.sum()) - 1.0)}
+
+
+def _raw_feature(dataset: PreparedDataset, feature_name: str, start: int, end: int) -> np.ndarray | None:
+    if feature_name not in dataset.feature_names:
+        return None
+    idx = dataset.feature_names.index(feature_name)
+    values = dataset.feature_inputs[:, start:end, idx].astype("float64")
+    if dataset.feature_mean is not None and dataset.feature_std is not None:
+        values = values * float(dataset.feature_std[idx]) + float(dataset.feature_mean[idx])
+    return values
+
+
+def _raw_feature_first(dataset: PreparedDataset, prefixes: tuple[str, ...], start: int, end: int) -> np.ndarray | None:
+    for prefix in prefixes:
+        for name in dataset.feature_names:
+            if name.startswith(prefix):
+                return _raw_feature(dataset, name, start, end)
+    return None
+
+
 def backtest_scores(
     dataset: PreparedDataset,
     pred: np.ndarray,
@@ -188,16 +248,135 @@ def backtest_scores(
     scores = pred[:, :, horizon_index]
     positions = (scores > threshold).astype("float64")
     next_returns = dataset.next_returns[:, start:end].astype("float64")
-    pnl_by_symbol = positions * next_returns
+    gross_by_symbol = positions * next_returns
     turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
-    pnl_by_symbol = pnl_by_symbol - turnover * cost
-    portfolio_returns = np.nanmean(pnl_by_symbol, axis=0)
+    cost_by_symbol = turnover * cost
+    portfolio_gross_returns = np.nanmean(gross_by_symbol, axis=0)
+    portfolio_cost_returns = np.nanmean(cost_by_symbol, axis=0)
+    portfolio_returns = portfolio_gross_returns - portfolio_cost_returns
     metrics = compute_pnl_metrics(portfolio_returns, positions).as_dict()
     metrics.update(
         {
+            **_return_summary(portfolio_gross_returns, "gross"),
+            "net_total_return": metrics["total_return"],
+            "cost_return": float(np.nansum(portfolio_cost_returns)),
             "threshold_bps": threshold_bps,
             "fixed_fee_bps": fixed_fee_bps,
             "fixed_slippage_bps": fixed_slippage_bps,
+        }
+    )
+    return metrics, positions, portfolio_returns
+
+
+def backtest_low_turnover_scores(
+    dataset: PreparedDataset,
+    pred: np.ndarray,
+    split: str,
+    horizon_index: int,
+    threshold_bps: float = 0.0,
+    fixed_fee_bps: float = 0.0,
+    fixed_slippage_bps: float = 0.0,
+    config: LowTurnoverConfig | None = None,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    start, end = {
+        "train": dataset.train_range,
+        "val": dataset.val_range,
+        "test": dataset.test_range,
+    }[split]
+    cfg = config or LowTurnoverConfig()
+    threshold = threshold_bps / 10_000.0
+    cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
+    scores = pred[:, :, horizon_index].astype("float64")
+    n_symbols, n_times = scores.shape
+    positions = np.zeros((n_symbols, n_times), dtype="float64")
+    current = np.zeros(n_symbols, dtype="float64")
+    entry_time = np.full(n_symbols, -10**9, dtype="int64")
+    cooldown_until = np.zeros(n_symbols, dtype="int64")
+    rebalance_interval = max(1, int(cfg.rebalance_interval_bars))
+    min_holding = max(0, int(cfg.min_holding_bars))
+    cooldown = max(0, int(cfg.cooldown_bars))
+    top_k = max(0, int(cfg.top_k))
+
+    liquidity_rank = _raw_feature_first(dataset, ("cross_section_amount_rank_30m", "cross_section_amount_rank_"), start, end)
+    illiquidity_rank = _raw_feature_first(
+        dataset, ("cross_section_amihud_rank_30m", "cross_section_amihud_rank_"), start, end
+    )
+
+    for t in range(n_times):
+        if t % rebalance_interval != 0:
+            positions[:, t] = current
+            continue
+
+        eligible = np.isfinite(scores[:, t]) & (scores[:, t] > threshold)
+        if cfg.min_liquidity_rank is not None and liquidity_rank is not None:
+            eligible &= liquidity_rank[:, t] >= cfg.min_liquidity_rank
+        if cfg.max_illiquidity_rank is not None and illiquidity_rank is not None:
+            eligible &= illiquidity_rank[:, t] <= cfg.max_illiquidity_rank
+
+        ranked = np.argsort(scores[:, t])[::-1]
+        selected = [int(i) for i in ranked if eligible[i]][:top_k]
+        target = np.zeros(n_symbols, dtype="float64")
+        if selected:
+            slot = min(cfg.max_position_per_symbol, cfg.max_total_position / len(selected))
+            target[selected] = slot
+
+        for i in range(n_symbols):
+            if current[i] > target[i] and t - entry_time[i] < min_holding:
+                target[i] = current[i]
+            if current[i] <= 1e-12 and target[i] > 0 and t < cooldown_until[i]:
+                target[i] = 0.0
+
+        total_target = target.sum()
+        if total_target > cfg.max_total_position and total_target > 0:
+            protected = (current > 0) & (target >= current) & ((t - entry_time) < min_holding)
+            flexible = ~protected
+            protected_total = target[protected].sum()
+            flexible_total = target[flexible].sum()
+            room = max(cfg.max_total_position - protected_total, 0.0)
+            if flexible_total > 0:
+                target[flexible] *= room / flexible_total
+
+        if cfg.max_turnover_per_step < 1.0:
+            delta = target - current
+            step_cap = max(float(cfg.max_turnover_per_step), 0.0)
+            delta = np.clip(delta, -step_cap, step_cap)
+            target = current + delta
+
+        sold = (current > 1e-12) & (target <= 1e-12)
+        cooldown_until[sold] = t + cooldown
+        bought = (current <= 1e-12) & (target > 1e-12)
+        entry_time[bought] = t
+        current = target
+        positions[:, t] = current
+
+    next_returns = dataset.next_returns[:, start:end].astype("float64")
+    gross_returns = np.nansum(positions * next_returns, axis=0)
+    turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
+    cost_returns = np.nansum(turnover * cost, axis=0)
+    portfolio_returns = gross_returns - cost_returns
+    metrics = compute_pnl_metrics(portfolio_returns, positions).as_dict()
+    total_position = np.nansum(positions, axis=0)
+    total_turnover = np.nansum(turnover, axis=0)
+    metrics.update(
+        {
+            **_return_summary(gross_returns, "gross"),
+            "net_total_return": metrics["total_return"],
+            "cost_return": float(np.nansum(cost_returns)),
+            "turnover": float(np.nanmean(total_turnover)) if len(total_turnover) else 0.0,
+            "average_position": float(np.nanmean(total_position)) if len(total_position) else 0.0,
+            "max_total_position_observed": float(np.nanmax(total_position)) if len(total_position) else 0.0,
+            "threshold_bps": threshold_bps,
+            "fixed_fee_bps": fixed_fee_bps,
+            "fixed_slippage_bps": fixed_slippage_bps,
+            "top_k": cfg.top_k,
+            "rebalance_interval_bars": cfg.rebalance_interval_bars,
+            "min_holding_bars": cfg.min_holding_bars,
+            "cooldown_bars": cfg.cooldown_bars,
+            "max_position_per_symbol": cfg.max_position_per_symbol,
+            "max_total_position": cfg.max_total_position,
+            "max_turnover_per_step": cfg.max_turnover_per_step,
+            "min_liquidity_rank": cfg.min_liquidity_rank,
+            "max_illiquidity_rank": cfg.max_illiquidity_rank,
         }
     )
     return metrics, positions, portfolio_returns
@@ -248,9 +427,19 @@ def backtest_buy_and_hold(
     next_returns = dataset.next_returns[:, start:end].astype("float64")
     cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
     turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
-    portfolio_returns = np.nanmean(positions * next_returns - turnover * cost, axis=0)
+    portfolio_gross_returns = np.nanmean(positions * next_returns, axis=0)
+    portfolio_cost_returns = np.nanmean(turnover * cost, axis=0)
+    portfolio_returns = portfolio_gross_returns - portfolio_cost_returns
     metrics = compute_pnl_metrics(portfolio_returns, positions).as_dict()
-    metrics.update({"fixed_fee_bps": fixed_fee_bps, "fixed_slippage_bps": fixed_slippage_bps})
+    metrics.update(
+        {
+            **_return_summary(portfolio_gross_returns, "gross"),
+            "net_total_return": metrics["total_return"],
+            "cost_return": float(np.nansum(portfolio_cost_returns)),
+            "fixed_fee_bps": fixed_fee_bps,
+            "fixed_slippage_bps": fixed_slippage_bps,
+        }
+    )
     return metrics
 
 
@@ -262,4 +451,6 @@ def no_trade_metrics(dataset: PreparedDataset, split: str) -> dict:
     }[split]
     positions = np.zeros((dataset.n_symbols, end - start), dtype="float64")
     returns = np.zeros(end - start, dtype="float64")
-    return compute_pnl_metrics(returns, positions).as_dict()
+    metrics = compute_pnl_metrics(returns, positions).as_dict()
+    metrics.update({"gross_total_return": 0.0, "net_total_return": 0.0, "cost_return": 0.0})
+    return metrics

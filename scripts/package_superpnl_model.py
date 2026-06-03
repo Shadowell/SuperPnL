@@ -153,6 +153,7 @@ def main() -> None:
         "bar_feature_names": BAR_FEATURE_NAMES,
         "feature_names": cache_metadata["feature_names"],
         "feature_windows_minutes": cache_metadata["config"]["feature_windows"],
+        "factor_set": cache_metadata["config"].get("factor_set", "base"),
         "bar_size": "1m",
         "normalization": {
             "stats_file": "normalization_stats.npz",

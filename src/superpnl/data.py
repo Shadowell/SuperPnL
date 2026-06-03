@@ -11,8 +11,9 @@ import pandas as pd
 
 
 BAR_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
-DEFAULT_FEATURE_WINDOWS = (5, 15, 30)
-DEFAULT_HORIZONS = (5, 15)
+DEFAULT_FEATURE_WINDOWS = (5, 15, 30, 60, 240, 1440)
+DEFAULT_HORIZONS = (5, 15, 30, 60, 240, 1440)
+SUPPORTED_FACTOR_SETS = ("base", "expanded")
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class DatasetConfig:
     lookback: int = 256
     horizons: tuple[int, ...] = DEFAULT_HORIZONS
     feature_windows: tuple[int, ...] = DEFAULT_FEATURE_WINDOWS
+    factor_set: str = "base"
     min_coverage: float = 0.995
 
     def to_json(self) -> str:
@@ -139,8 +141,17 @@ def _zscore(series: pd.Series, window: int) -> pd.Series:
     return ((series - mean) / std.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
 
-def _symbol_features(df: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame:
+def _rolling_beta(asset_ret: pd.Series, benchmark_ret: pd.Series, window: int) -> pd.Series:
+    cov = asset_ret.rolling(window, min_periods=window).cov(benchmark_ret)
+    var = benchmark_ret.rolling(window, min_periods=window).var(ddof=0)
+    return (cov / var.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+
+def _symbol_features(df: pd.DataFrame, windows: tuple[int, ...], factor_set: str) -> pd.DataFrame:
     close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    amount = df["amount"]
     log_close = np.log(close)
     log_ret_1m = log_close.diff()
     out = pd.DataFrame(index=df.index)
@@ -157,10 +168,46 @@ def _symbol_features(df: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame
         ma = close.rolling(w, min_periods=w).mean()
         std = close.rolling(w, min_periods=w).std(ddof=0)
         out[f"boll_z_{w}m"] = (close - ma) / (2 * std.replace(0, np.nan))
+    if factor_set == "expanded":
+        abs_ret = log_ret_1m.abs()
+        log_amount = np.log1p(amount)
+        bar_range = np.log(high / low.replace(0, np.nan))
+        for w in windows:
+            ret_w = out[f"ret_{w}m"]
+            vol_w = out[f"vol_std_{w}m"]
+            ema = close.ewm(span=w, adjust=False).mean()
+            rolling_high = high.rolling(w, min_periods=w).max()
+            rolling_low = low.rolling(w, min_periods=w).min()
+            amount_z = _zscore(log_amount, w)
+            amount_mean = log_amount.rolling(w, min_periods=w).mean()
+            amihud = (abs_ret / amount.replace(0, np.nan)).rolling(w, min_periods=w).mean()
+            downside = log_ret_1m.clip(upper=0).rolling(w, min_periods=w).std(ddof=0)
+            jump_scale = abs_ret / vol_w.replace(0, np.nan)
+
+            out[f"trend_score_{w}m"] = ret_w / (vol_w.replace(0, np.nan) * math.sqrt(w))
+            out[f"ema_slope_{w}m"] = np.log(ema / ema.shift(w).replace(0, np.nan))
+            out[f"breakout_pos_{w}m"] = (
+                (close - rolling_low) / (rolling_high - rolling_low).replace(0, np.nan) - 0.5
+            )
+            out[f"amount_z_{w}m"] = amount_z
+            out[f"log_amount_mean_{w}m"] = amount_mean
+            out[f"amihud_{w}m"] = amihud
+            out[f"downside_vol_{w}m"] = downside
+            out[f"range_mean_{w}m"] = bar_range.rolling(w, min_periods=w).mean()
+            out[f"jump_intensity_{w}m"] = (jump_scale > 3.0).rolling(w, min_periods=w).mean()
+            out[f"volume_confirmed_ret_{w}m"] = ret_w * amount_z
     if 5 in windows and 15 in windows:
         out["macd_5m_15m"] = (close.ewm(span=5, adjust=False).mean() - close.ewm(span=15, adjust=False).mean()) / close
     if 15 in windows and 30 in windows:
         out["macd_15m_30m"] = (close.ewm(span=15, adjust=False).mean() - close.ewm(span=30, adjust=False).mean()) / close
+    if factor_set == "expanded":
+        sorted_windows = sorted(windows)
+        for fast, slow in zip(sorted_windows, sorted_windows[1:]):
+            name = f"macd_{fast}m_{slow}m"
+            if name not in out:
+                out[name] = (
+                    close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+                ) / close
     return out
 
 
@@ -201,25 +248,29 @@ def _standardize_train(data: np.ndarray, train_slice: slice) -> tuple[np.ndarray
 
 
 def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
+    if config.factor_set not in SUPPORTED_FACTOR_SETS:
+        raise ValueError(f"factor_set must be one of {SUPPORTED_FACTOR_SETS}, got {config.factor_set!r}")
     symbols, frames = load_raw_bars(config.raw_dir, config.min_coverage)
     timestamps = frames[symbols[0]]["timestamp"].to_numpy(dtype="int64")
     n_symbols = len(symbols)
     n_times = len(timestamps)
     windows = tuple(config.feature_windows)
+    factor_set = config.factor_set
 
     bar_blocks = []
-    feature_blocks = []
     label_blocks = []
     next_return_blocks = []
     realized_horizon_blocks = []
     symbol_feature_frames: dict[str, pd.DataFrame] = {}
+    symbol_log_returns: dict[str, pd.Series] = {}
 
     for symbol in symbols:
         df = frames[symbol]
         bars = _bar_inputs(df)
-        symbol_features = _symbol_features(df, windows)
+        symbol_features = _symbol_features(df, windows, factor_set)
         symbol_feature_frames[symbol] = symbol_features
         close = df["close"]
+        symbol_log_returns[symbol] = np.log(close).diff()
         open_ = df["open"]
         labels = []
         for horizon in config.horizons:
@@ -233,7 +284,8 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
         next_return_blocks.append(next_return)
         bar_blocks.append(bars)
 
-    feature_names = list(next(iter(symbol_feature_frames.values())).columns)
+    symbol_extra_frames: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol in symbols}
+
     # Market context uses BTC as benchmark.
     btc_symbol = "BTC-USDT" if "BTC-USDT" in symbol_feature_frames else symbols[0]
     btc_features = symbol_feature_frames[btc_symbol]
@@ -241,6 +293,28 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
     for w in windows:
         market[f"market_ret_{w}m"] = btc_features[f"ret_{w}m"]
         market[f"market_vol_{w}m"] = btc_features[f"vol_std_{w}m"]
+    if factor_set == "expanded":
+        eth_symbol = "ETH-USDT" if "ETH-USDT" in symbol_feature_frames else None
+        benchmark_symbols = {"btc": btc_symbol}
+        if eth_symbol is not None:
+            benchmark_symbols["eth"] = eth_symbol
+        for symbol in symbols:
+            asset_ret = symbol_log_returns[symbol]
+            beta_resid_columns = {}
+            for bench_name, bench_symbol in benchmark_symbols.items():
+                bench_ret = symbol_log_returns[bench_symbol]
+                bench_features = symbol_feature_frames[bench_symbol]
+                for w in windows:
+                    beta = _rolling_beta(asset_ret, bench_ret, w)
+                    beta_resid_columns[f"{bench_name}_beta_{w}m"] = beta
+                    beta_resid_columns[f"{bench_name}_resid_ret_{w}m"] = (
+                        symbol_feature_frames[symbol][f"ret_{w}m"] - beta * bench_features[f"ret_{w}m"]
+                    )
+            symbol_extra_frames[symbol].append(pd.DataFrame(beta_resid_columns, index=symbol_feature_frames[symbol].index))
+        for w in windows:
+            ret_matrix = pd.DataFrame({sym: symbol_feature_frames[sym][f"ret_{w}m"] for sym in symbols})
+            market[f"market_dispersion_{w}m"] = ret_matrix.std(axis=1, ddof=0)
+            market[f"market_breadth_pos_{w}m"] = (ret_matrix > 0).mean(axis=1) - 0.5
 
     # Cross-section ranks for ret and volatility windows.
     for w in windows:
@@ -248,9 +322,30 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
         vol_matrix = pd.DataFrame({sym: symbol_feature_frames[sym][f"vol_std_{w}m"] for sym in symbols})
         ret_rank = ret_matrix.rank(axis=1, pct=True) - 0.5
         vol_rank = vol_matrix.rank(axis=1, pct=True) - 0.5
+        amount_rank = amihud_rank = resid_rank = None
+        if factor_set == "expanded":
+            amount_matrix = pd.DataFrame({sym: symbol_feature_frames[sym][f"log_amount_mean_{w}m"] for sym in symbols})
+            amihud_matrix = pd.DataFrame({sym: symbol_feature_frames[sym][f"amihud_{w}m"] for sym in symbols})
+            resid_matrix = pd.DataFrame(
+                {
+                    sym: symbol_extra_frames[sym][0][f"btc_resid_ret_{w}m"]
+                    for sym in symbols
+                    if symbol_extra_frames[sym]
+                }
+            )
+            amount_rank = amount_matrix.rank(axis=1, pct=True) - 0.5
+            amihud_rank = amihud_matrix.rank(axis=1, pct=True) - 0.5
+            resid_rank = resid_matrix.rank(axis=1, pct=True) - 0.5
         for sym in symbols:
-            symbol_feature_frames[sym][f"cross_section_ret_rank_{w}m"] = ret_rank[sym]
-            symbol_feature_frames[sym][f"cross_section_vol_rank_{w}m"] = vol_rank[sym]
+            rank_columns = {
+                f"cross_section_ret_rank_{w}m": ret_rank[sym],
+                f"cross_section_vol_rank_{w}m": vol_rank[sym],
+            }
+            if amount_rank is not None and amihud_rank is not None and resid_rank is not None:
+                rank_columns[f"cross_section_amount_rank_{w}m"] = amount_rank[sym]
+                rank_columns[f"cross_section_amihud_rank_{w}m"] = amihud_rank[sym]
+                rank_columns[f"cross_section_btc_resid_ret_rank_{w}m"] = resid_rank[sym]
+            symbol_extra_frames[sym].append(pd.DataFrame(rank_columns, index=symbol_feature_frames[sym].index))
 
     time_frame = _time_features(timestamps)
     extra_names = list(market.columns) + [
@@ -261,7 +356,7 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
 
     combined_feature_blocks = []
     for symbol in symbols:
-        features = symbol_feature_frames[symbol].copy()
+        features = pd.concat([symbol_feature_frames[symbol], *symbol_extra_frames[symbol]], axis=1).copy()
         for col in market.columns:
             features[col] = market[col].to_numpy()
         for col in time_frame.columns:

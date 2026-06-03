@@ -9,6 +9,7 @@
 - 只做现货，不使用 funding、OI、basis 等永续合约特征。
 - 数据层只获取 1min K 线；特征窗口使用真实时间长度命名，例如 `5m/15m/30m`。
 - `feature_windows` 是配置项，默认可以用 `["5m", "15m", "30m"]`，但策略可以改成 `["15m", "30m", "60m"]`。
+- `factor_set` 是特征集合配置，默认 `base` 保持旧实验可复现；`expanded` 用于下一轮因子优化实验。
 - 同时覆盖收益、波动、市场环境和时间周期。
 - 所有特征只能使用决策时刻 `t` 及以前的数据。
 - 任何新增特征都必须说明是否可能产生未来信息泄漏。
@@ -116,6 +117,46 @@ macd_15m_30m = (EMA(close, window_bars(15m)) - EMA(close, window_bars(30m))) / c
 
 泄漏判断：EMA 必须按时间递推计算，不允许全样本双向平滑。
 
+### 2.7 Expanded 趋势、流动性与风险特征
+
+当 `factor_set=expanded` 时，对每个 `feature_windows` 增加：
+
+```text
+trend_score_{W}
+ema_slope_{W}
+breakout_pos_{W}
+amount_z_{W}
+log_amount_mean_{W}
+amihud_{W}
+downside_vol_{W}
+range_mean_{W}
+jump_intensity_{W}
+volume_confirmed_ret_{W}
+```
+
+定义：
+
+```text
+trend_score_{W} = ret_{W} / (vol_std_{W} * sqrt(window_bars(W)))
+ema_slope_{W} = log(EMA_{W,t} / EMA_{W,t-W})
+breakout_pos_{W} = (close_t - rolling_low_{W}) / (rolling_high_{W} - rolling_low_{W}) - 0.5
+amount_z_{W} = rolling z-score(log1p(amount), W)
+log_amount_mean_{W} = rolling_mean(log1p(amount), W)
+amihud_{W} = rolling_mean(abs(1m_return) / amount, W)
+downside_vol_{W} = rolling_std(min(1m_return, 0), W)
+range_mean_{W} = rolling_mean(log(high / low), W)
+jump_intensity_{W} = rolling_mean(abs(1m_return) / vol_std_{W} > 3, W)
+volume_confirmed_ret_{W} = ret_{W} * amount_z_{W}
+```
+
+用途：
+
+- `trend_score/ema_slope/breakout_pos/volume_confirmed_ret` 聚合多周期趋势信息。
+- `log_amount_mean/amihud` 用于刻画流动性，优先作为交易过滤或仓位缩放依据。
+- `downside_vol/range_mean/jump_intensity` 用于识别高噪声和跳变风险。
+
+泄漏判断：这些特征都来自当前 bar 收盘后已知的 OHLCV 和历史 rolling 统计；无未来信息泄漏。风险在于用未来成交额或未来上市状态重选 universe，这属于幸存者偏差，必须通过固定 `metadata.json` 避免。
+
 ---
 
 ## 3. 市场环境特征
@@ -175,6 +216,44 @@ cross_section_vol_rank_{W} = 当前币 vol_std_{W} 在同一时刻币池中的�
 
 泄漏判断：只能使用同一决策时刻已经可见的币池数据。不能使用未来成分股、未来成交额排序或事后筛选出的 survivor universe。
 
+### 3.4 Expanded 市场状态与残差特征
+
+当 `factor_set=expanded` 时，增加：
+
+```text
+market_dispersion_{W}
+market_breadth_pos_{W}
+btc_beta_{W}
+btc_resid_ret_{W}
+eth_beta_{W}
+eth_resid_ret_{W}
+cross_section_amount_rank_{W}
+cross_section_amihud_rank_{W}
+cross_section_btc_resid_ret_rank_{W}
+```
+
+定义：
+
+```text
+market_dispersion_{W} = 同一时刻 universe 内 ret_{W} 的截面标准差
+market_breadth_pos_{W} = 同一时刻 ret_{W} > 0 的标的占比 - 0.5
+btc_beta_{W} = rolling_beta(symbol_1m_return, BTC_1m_return, W)
+btc_resid_ret_{W} = symbol_ret_{W} - btc_beta_{W} * BTC_ret_{W}
+eth_beta_{W} = rolling_beta(symbol_1m_return, ETH_1m_return, W)
+eth_resid_ret_{W} = symbol_ret_{W} - eth_beta_{W} * ETH_ret_{W}
+cross_section_amount_rank_{W} = 当前币 log_amount_mean_{W} 在同一时刻币池中的分位数
+cross_section_amihud_rank_{W} = 当前币 amihud_{W} 在同一时刻币池中的分位数
+cross_section_btc_resid_ret_rank_{W} = 当前币 btc_resid_ret_{W} 在同一时刻币池中的分位数
+```
+
+用途：
+
+- 市场宽度和离散度帮助识别整体 risk-on/risk-off 与截面机会强弱。
+- BTC/ETH beta 和 residual return 用于区分市场 beta 与独立强弱。
+- 成交额和 Amihud rank 优先用于低换手策略层过滤，不建议在未做成本验证前直接放大低流动性币仓位。
+
+泄漏判断：rolling beta、市场宽度、截面 rank 都只使用同一时刻及以前数据；本身无未来信息泄漏。主要风险仍是 universe 选择和标准化：不能用未来成交额筛币，不能用 val/test/live 数据重新拟合标准化。
+
 ---
 
 ## 4. 时间周期特征
@@ -204,10 +283,11 @@ dayofweek_cos = cos(2*pi*dayofweek/7)
 默认窗口下：
 
 ```text
-33 个左右
+factor_set=base: 33 个左右
+factor_set=expanded: 随 feature_windows 数量增加，通常会明显高于 base
 ```
 
-第一版不强行凑固定维度。特征维度按 `feature_windows` 和真实可用数据确定。
+第一版不强行凑固定维度。特征维度按 `factor_set`、`feature_windows`、BTC/ETH 是否在 universe 中和真实可用数据确定。
 
 ---
 

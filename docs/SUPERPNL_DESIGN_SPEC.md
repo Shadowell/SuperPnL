@@ -49,10 +49,10 @@ target_pos_{h} 现货目标仓位，范围 [0, 1]
 
 ```text
 bar_size = "1m"
-strategy_horizons = ["5m", "15m"] 或 ["5m", "15m", "30m"]
+strategy_horizons = ["5m", "15m", "30m", "60m", "240m", "1440m"]
 ```
 
-`5m` 对应未来 5 根 1min bar，`15m` 对应未来 15 根 1min bar。策略可以只交易 `5m/15m`，也可以增加 `30m/60m`。不建议把 1min horizon 作为默认主交易周期，因为手续费和滑点对极短周期信号更敏感。
+`5m` 对应未来 5 根 1min bar，`1440m` 对应未来 1 天。策略可以只交易短周期，也可以增加 `60m/240m/1440m` 作为低换手主策略。不建议把 1min horizon 作为默认主交易周期，因为手续费和滑点对极短周期信号更敏感。
 
 ### 2.2 约束目标
 
@@ -81,9 +81,10 @@ strategy_horizons = ["5m", "15m"] 或 ["5m", "15m", "30m"]
 
 ## 3. 总体架构
 
-推荐第一版架构：
+当前项目采用双轨架构 (Dual-Track Architecture)，深度学习与树模型互为补充：
 
 ```text
+(A) 深度学习路线 (TCN)
                      ┌────────────────────────┐
 OHLCV history ──────▶│ Bar Encoder             │
                      │ Causal Dilated TCN      │
@@ -104,15 +105,29 @@ Feature history ────▶│ Feature Encoder         │
      │ Path Head     │    │ Alpha Head    │    │ Position Head │
      │ auxiliary     │    │ edge/rank     │    │ [0, 1]        │
      └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-            │                   │                   │
-            └───────────────────▼───────────────────┘
+
+(B) 树模型路线 (LightGBM Tabular)
+                     ┌────────────────────────┐
+Latest Cross-Section ─▶│ LightGBM Booster      │
+                     │ Huber Loss / EarlyStop  │
+                     └───────────┬────────────┘
+                                 │
+                                 ▼
+                         pred_ret_{h} (Step-wise)
+
+                                 │
                             Backtest Engine
                                  │
                                  ▼
                    net PnL / Sharpe / drawdown
 ```
 
-### 3.1 为什么保留 Path Head
+### 3.1 引入 LightGBM 的必要性
+虽然 TCN 能够端到端提取复杂的 K 线序列特征，但在实测中暴露出**高频抖动导致换手率极高**的痛点。LightGBM 的引入解决了两个关键问题：
+1. **天然的低换手特性**：树模型的阶梯状输出有效过滤了微小噪声，极大降低了相邻时间步的仓位翻转，从而在加入真实交易成本后保住了 PnL。
+2. **强大的截面拟合能力**：树模型对横向的截面流动性、波动率排序等 `expanded` 因子非常敏感，Rank IC 指标显著优于 TCN。
+
+### 3.2 为什么保留 Path Head
 
 Path Head 不是最终目标，但仍有价值：
 
@@ -594,15 +609,13 @@ OHLCV + technical features -> Alpha/Position Head
 
 需要注意：技术特征是 OHLCV 的派生信息，提升不一定代表新信息，只能说明归纳偏置有帮助。
 
-### 10.5 Full-feature trading model
+### 10.6 LightGBM Tabular model
 
-加入全部现货可用特征：
+将 TCN 所需的 `[B, L, C]` 时序特征展平为当前时刻截面特征，利用 LightGBM 进行预测。由于树模型天然对截面排序更友好且输出呈阶梯状，是当前解决高频换手痛点的核心 baseline。
 
 ```text
-OHLCV + technical + market context + time features
+Cross-Section Features -> LightGBM Booster -> pred_ret_h
 ```
-
-这是第一版主模型。
 
 ---
 
