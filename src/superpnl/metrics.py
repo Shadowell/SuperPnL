@@ -13,11 +13,11 @@ MINUTES_PER_YEAR = 365 * 24 * 60
 @dataclass
 class PnLMetrics:
     total_return: float
-    annualized_return: float
+    annualized_return: float | None
     sharpe: float
     sortino: float
     max_drawdown: float
-    calmar: float
+    calmar: float | None
     win_rate: float
     profit_factor: float
     turnover: float
@@ -25,7 +25,7 @@ class PnLMetrics:
     average_holding_minutes: float
     trade_count: int
 
-    def as_dict(self) -> dict[str, float | int]:
+    def as_dict(self) -> dict[str, float | int | None]:
         return {
             "total_return": self.total_return,
             "annualized_return": self.annualized_return,
@@ -50,9 +50,15 @@ def compute_pnl_metrics(portfolio_returns: np.ndarray, positions: np.ndarray) ->
         mean = returns.mean()
         std = returns.std(ddof=1)
         sharpe = float(mean / std * math.sqrt(MINUTES_PER_YEAR)) if std > 1e-12 else 0.0
-        downside = returns[returns < 0].std(ddof=1) if np.any(returns < 0) else 0.0
+        negative_returns = returns[returns < 0]
+        downside = negative_returns.std(ddof=1) if len(negative_returns) > 1 else 0.0
         sortino = float(mean / downside * math.sqrt(MINUTES_PER_YEAR)) if downside > 1e-12 else 0.0
-        annualized_return = float(math.exp(mean * MINUTES_PER_YEAR) - 1.0)
+        try:
+            annualized_return = math.expm1(float(mean) * MINUTES_PER_YEAR)
+        except OverflowError:
+            annualized_return = None
+        if annualized_return is not None and not math.isfinite(annualized_return):
+            annualized_return = None
     else:
         sharpe = 0.0
         sortino = 0.0
@@ -61,7 +67,12 @@ def compute_pnl_metrics(portfolio_returns: np.ndarray, positions: np.ndarray) ->
     peak = np.maximum.accumulate(equity_with_initial)
     drawdown = equity_with_initial / peak - 1.0
     max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
-    calmar = float(annualized_return / abs(max_drawdown)) if abs(max_drawdown) > 1e-12 else 0.0
+    if annualized_return is None:
+        calmar = None
+    else:
+        calmar = float(annualized_return / abs(max_drawdown)) if abs(max_drawdown) > 1e-12 else 0.0
+        if not math.isfinite(calmar):
+            calmar = None
     wins = returns[returns > 0]
     losses = returns[returns < 0]
     win_rate = float((returns > 0).mean()) if len(returns) else 0.0

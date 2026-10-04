@@ -28,3 +28,8 @@
 T002→T003→T004→T008；T005→T006→T007；T009→T010。
 T011 依赖 T008、T007、T010；T012 可独立；T013/T014 最后。
 仅不同文件的任务并行；根 agent 串行提交，其他 agent 不操作 Git index。
+
+## Phase 5: Convergence
+- [x] T015 修复 #12 metrics.py 年化溢出、run_superpnl_experiment.py unavailable显示，tests/test_metrics.py/test_reporting.py。
+- [ ] T016 修复 #13 training.py非有限预测和阈值拒绝，tests/test_backtest.py。
+- [ ] T017 修正 #1/#2 分月结束时间与分币净贡献归因，scripts/run_superpnl_experiment.py、tests/test_reporting.py。

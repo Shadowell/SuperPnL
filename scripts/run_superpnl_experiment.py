@@ -40,7 +40,9 @@ def ensure_dataset(args) -> object:
     return prepare_dataset(config)
 
 
-def format_metric(value: float | int) -> str:
+def format_metric(value: float | int | None) -> str:
+    if value is None:
+        return "N/A"
     if isinstance(value, int):
         return str(value)
     if abs(value) >= 10:
