@@ -288,9 +288,17 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
 
     train_end = valid_start + int((valid_end - valid_start) * 0.70)
     val_end = valid_start + int((valid_end - valid_start) * 0.85)
-    train_range = (valid_start, train_end)
-    val_range = (train_end, val_end)
+    # Labels enter at t+1 and exit at t+h+1. Remove boundary samples
+    # whose final price would come from the following evaluation partition.
+    purge = max_horizon + 1
+    train_range = (valid_start, train_end - purge)
+    val_range = (train_end, val_end - purge)
     test_range = (val_end, valid_end)
+    for split, (start, end) in {
+        "train": train_range, "val": val_range, "test": test_range
+    }.items():
+        if end <= start:
+            raise ValueError(f"empty {split} split after label purge; provide more data or shorter horizons")
 
     bar_inputs, bar_mean, bar_std = _standardize_train(bar_inputs, slice(*train_range))
     feature_inputs, feature_mean, feature_std = _standardize_train(feature_inputs, slice(*train_range))
