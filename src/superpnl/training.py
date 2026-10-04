@@ -12,6 +12,7 @@ from torch import nn
 from .data import PreparedDataset, WindowBatcher
 from .metrics import compute_pnl_metrics, rank_ic_by_time, regression_metrics
 from .model import SuperPnLModel
+from .portfolio import PortfolioLedger, simulate_portfolio
 
 
 @dataclass
@@ -186,13 +187,10 @@ def backtest_scores(
     threshold = threshold_bps / 10_000.0
     cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
     scores = pred[:, :, horizon_index]
-    positions = (scores > threshold).astype("float64")
+    signals = (scores > threshold).astype("float64")
     next_returns = dataset.next_returns[:, start:end].astype("float64")
-    pnl_by_symbol = positions * next_returns
-    turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
-    pnl_by_symbol = pnl_by_symbol - turnover * cost
-    portfolio_returns = np.nanmean(pnl_by_symbol, axis=0)
-    metrics = compute_pnl_metrics(portfolio_returns, positions).as_dict()
+    ledger = simulate_portfolio(next_returns, signals, cost_rate=cost)
+    metrics = _ledger_metrics(ledger)
     metrics.update(
         {
             "threshold_bps": threshold_bps,
@@ -200,7 +198,18 @@ def backtest_scores(
             "fixed_slippage_bps": fixed_slippage_bps,
         }
     )
-    return metrics, positions, portfolio_returns
+    return metrics, ledger.positions, ledger.portfolio_returns
+
+
+def _ledger_metrics(ledger: PortfolioLedger) -> dict:
+    metrics = compute_pnl_metrics(ledger.portfolio_returns, ledger.positions).as_dict()
+    if len(ledger.equity):
+        previous_equity = np.r_[1.0, ledger.equity[:-1]]
+        traded_fraction = ledger.traded_notional / previous_equity[None, :]
+        metrics["turnover"] = float(traded_fraction.sum(axis=0).mean())
+        metrics["trade_count"] = int((traded_fraction > 1e-12).sum())
+        metrics["average_position"] = float(ledger.positions.sum(axis=0).mean())
+    return metrics
 
 
 def backtest_rule_momentum(
@@ -244,12 +253,11 @@ def backtest_buy_and_hold(
         "val": dataset.val_range,
         "test": dataset.test_range,
     }[split]
-    positions = np.ones((dataset.n_symbols, end - start), dtype="float64")
+    signals = np.ones((dataset.n_symbols, end - start), dtype="float64")
     next_returns = dataset.next_returns[:, start:end].astype("float64")
     cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
-    turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
-    portfolio_returns = np.nanmean(positions * next_returns - turnover * cost, axis=0)
-    metrics = compute_pnl_metrics(portfolio_returns, positions).as_dict()
+    ledger = simulate_portfolio(next_returns, signals, cost_rate=cost, rebalance=False)
+    metrics = _ledger_metrics(ledger)
     metrics.update({"fixed_fee_bps": fixed_fee_bps, "fixed_slippage_bps": fixed_slippage_bps})
     return metrics
 
