@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import torch
+
+from superpnl.model import SuperPnLModel
 
 
 BAR_FEATURE_NAMES = [
@@ -107,11 +110,22 @@ def main() -> None:
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True)
 
-    run_config = read_json(run_dir / "run_config.json")
     cache_metadata = read_json(cache_dir / "metadata.json")
     metrics = read_json(run_dir / "metrics.json")
 
     model_src = run_dir / f"{args.model_name}.pt"
+    checkpoint = torch.load(model_src, map_location="cpu", weights_only=True)
+    state = checkpoint["model"]
+    use_features = checkpoint["use_features"]
+    architecture = {
+        "use_features": use_features,
+        "bar_dim": int(state["bar_encoder.proj.weight"].shape[1]),
+        "feature_dim": int(state["feature_encoder.proj.weight"].shape[1]) if use_features else 0,
+        "num_horizons": int(state["head.4.weight"].shape[0]) // 2,
+        "hidden_dim": int(state["bar_encoder.proj.weight"].shape[0]),
+        "dropout": float(checkpoint["config"]["dropout"]),
+    }
+    SuperPnLModel(**architecture).load_state_dict(state)
     model_dst = package_dir / "model.pt"
     copy_required(model_src, model_dst)
 
@@ -132,22 +146,20 @@ def main() -> None:
     model_config = {
         "model_class": "superpnl.model.SuperPnLModel",
         "model_name": args.model_name,
-        "use_features": True,
-        "bar_dim": int(cache_metadata["bar_dim"]),
-        "feature_dim": int(cache_metadata["feature_dim"]),
-        "num_horizons": len(horizons),
-        "hidden_dim": int(run_config["train_config"]["hidden_dim"]),
-        "dropout": float(run_config["train_config"].get("dropout", 0.05)),
+        **architecture,
         "lookback": int(cache_metadata["lookback"]),
         "horizons": horizons,
         "horizon_index": {f"{h}m": i for i, h in enumerate(horizons)},
         "recommended_horizon": args.recommended_horizon,
         "recommended_horizon_index": horizons.index(recommended_horizon_minutes),
         "input_shapes": {
-            "bar": ["batch", int(cache_metadata["lookback"]), int(cache_metadata["bar_dim"])],
-            "features": ["batch", int(cache_metadata["lookback"]), int(cache_metadata["feature_dim"])],
+            "bar": ["batch", int(cache_metadata["lookback"]), architecture["bar_dim"]],
         },
     }
+    if use_features:
+        model_config["input_shapes"]["features"] = [
+            "batch", int(cache_metadata["lookback"]), architecture["feature_dim"],
+        ]
 
     feature_schema = {
         "bar_feature_names": BAR_FEATURE_NAMES,

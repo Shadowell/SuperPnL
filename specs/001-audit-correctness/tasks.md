@@ -15,7 +15,7 @@
 - [ ] T008 [US2] 修复 #8 data.py 与 run_superpnl_experiment.py 的缓存版本、配置及源指纹校验，tests/test_cache.py。
 
 ## Phase 3: US3 模型交付
-- [ ] T009 [P] [US3] 修复 #9 scripts/package_superpnl_model.py 从实际 checkpoint 取架构，tests/test_package.py。
+- [x] T009 [P] [US3] 修复 #9 scripts/package_superpnl_model.py 从实际 checkpoint 取架构，tests/test_package.py。
 - [ ] T010 [US3] 修复 #10 scripts/package_superpnl_model.py 失败安全替换，测试旧包保留。
 - [ ] T011 [US3] 修复 #5 data.py/training.py/package_superpnl_model.py 数据契约及不匹配拒绝测试。
 
