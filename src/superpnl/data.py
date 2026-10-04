@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .provenance import CACHE_VERSION, raw_fingerprint
+
 
 BAR_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
 DEFAULT_FEATURE_WINDOWS = (5, 15, 30)
@@ -50,6 +52,7 @@ class PreparedDataset:
     bar_std: np.ndarray | None = None
     feature_mean: np.ndarray | None = None
     feature_std: np.ndarray | None = None
+    cache_metadata: dict | None = None
 
     @property
     def n_symbols(self) -> int:
@@ -370,6 +373,7 @@ def save_prepared_dataset(dataset: PreparedDataset, cache_dir: str | Path, confi
     if dataset.feature_std is not None:
         np.save(cache / "feature_std.npy", dataset.feature_std)
     metadata = {
+        "cache_version": CACHE_VERSION,
         "symbols": dataset.symbols,
         "feature_names": dataset.feature_names,
         "horizons": list(dataset.horizons),
@@ -386,6 +390,13 @@ def save_prepared_dataset(dataset: PreparedDataset, cache_dir: str | Path, confi
     }
     if config is not None:
         metadata["config"] = json.loads(config.to_json())
+        metadata["source_fingerprint"] = raw_fingerprint(config.raw_dir)
+    elif dataset.cache_metadata:
+        metadata["config"] = dataset.cache_metadata["config"]
+        metadata["source_fingerprint"] = dataset.cache_metadata["source_fingerprint"]
+    else:
+        raise ValueError("dataset source configuration required; use --rebuild-cache")
+    dataset.cache_metadata = metadata
     (cache / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -393,6 +404,9 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
     cache = Path(cache_dir)
     mode = "r" if mmap else None
     metadata = json.loads((cache / "metadata.json").read_text())
+    if (metadata.get("cache_version") != CACHE_VERSION
+            or not metadata.get("source_fingerprint") or not metadata.get("config")):
+        raise ValueError("unsupported or incomplete cache; use --rebuild-cache")
     bar_mean = np.load(cache / "bar_mean.npy", mmap_mode=mode) if (cache / "bar_mean.npy").exists() else None
     bar_std = np.load(cache / "bar_std.npy", mmap_mode=mode) if (cache / "bar_std.npy").exists() else None
     feature_mean = (
@@ -402,6 +416,7 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
         np.load(cache / "feature_std.npy", mmap_mode=mode) if (cache / "feature_std.npy").exists() else None
     )
     return PreparedDataset(
+        cache_metadata=metadata,
         symbols=list(metadata["symbols"]),
         timestamps=np.load(cache / "timestamps.npy", mmap_mode=mode),
         bar_inputs=np.load(cache / "bar_inputs.npy", mmap_mode=mode),

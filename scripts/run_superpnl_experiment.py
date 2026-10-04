@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from superpnl.data import DatasetConfig, load_prepared_dataset, prepare_dataset
+from superpnl.provenance import validate_cache
 from superpnl.training import (
     TrainConfig,
     backtest_buy_and_hold,
@@ -25,8 +26,6 @@ from superpnl.training import (
 
 def ensure_dataset(args) -> object:
     cache_dir = Path(args.cache_dir)
-    if (cache_dir / "metadata.json").exists() and not args.rebuild_cache:
-        return load_prepared_dataset(cache_dir, mmap=True)
     config = DatasetConfig(
         raw_dir=args.raw_dir,
         cache_dir=args.cache_dir,
@@ -34,6 +33,10 @@ def ensure_dataset(args) -> object:
         horizons=tuple(int(x) for x in args.horizons.split(",")),
         feature_windows=tuple(int(x) for x in args.feature_windows.split(",")),
     )
+    if (cache_dir / "metadata.json").exists() and not args.rebuild_cache:
+        metadata = json.loads((cache_dir / "metadata.json").read_text())
+        validate_cache(json.loads(config.to_json()), metadata)
+        return load_prepared_dataset(cache_dir, mmap=True)
     return prepare_dataset(config)
 
 
