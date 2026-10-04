@@ -1,5 +1,9 @@
 # SuperPnL
 
+> **2026-10-05 审查修复后状态：** 本文的原版实验数字、图表和 15m 推荐属于修复前历史记录。
+> 原评测存在成交时点、组合记账和分区标签隔离错误，不能据此证明模型有效。
+> 必须先重建缓存、重新训练并重算所有基准；本轮未重跑真实历史实验，也未更新外部模型仓库。
+
 SuperPnL 是一个面向 **可交易 PnL** 的预测模型研究项目。当前版本聚焦 OKX 加密货币现货市场，用 1min K 线和历史因子预测未来多个策略 horizon 的收益，并通过 long-only 仓位回测评估模型是否真的能带来 PnL。
 
 这个项目的核心不是“把下一根 K 线价格预测得更准”，而是回答一个更直接的问题：
@@ -17,9 +21,9 @@ SuperPnL 是一个面向 **可交易 PnL** 的预测模型研究项目。当前�
 - no-trade、buy-and-hold、naive momentum、OHLCV-only、有因子模型的统一评测。
 - 5m / 15m / 30m horizon 的实验结果、回测对比图、Hugging Face 模型包和下游策略提示词。
 
-> 重要结论：当前实验只证明 `full_feature_tcn_15m` 在零成本回测下有明显 PnL。由于换手很高，加入真实 maker/taker 费率和滑点后会被成本打穿，因此不能把当前零成本结果直接理解成可实盘净收益。
+> 下列收益与成本敏感性结论均来自旧评测。修复后必须重新验证，不能直接用于模型选择或下游交易。
 
-## 当前结论
+## 修复前历史实验（待重算）
 
 本轮实验使用 OKX 现货非稳定币 `*-USDT` Top20，数据窗口为 `2025-04-30 15:00:00 UTC` 到 `2026-04-30 15:00:00 UTC`，每个 symbol 有 `525,601` 根 1min K 线。
 
@@ -46,7 +50,7 @@ threshold_bps = 0
 | full_feature_tcn | 15m | 62.46% | 9.099 | -5.79% | 0.2472 | 389,591 | 当前唯一正向结果 |
 | full_feature_tcn | 30m | -5.80% | -1.532 | -7.95% | 0.1594 | 251,256 | 30m 暂不推荐 |
 
-当前判断：
+历史观察（待修复后的评测重新验证）：
 
 - `15m` 是唯一值得继续研究的 horizon。
 - `5m` 噪声太高，当前因子和模型没有转化成 PnL。
@@ -108,16 +112,23 @@ PnL / turnover / drawdown / cost sensitivity
 
 现货 long-only 场景下，PnL 可以理解为“持仓带来的净资产变化”。
 
-简化定义：
+当前实现以资产价值和现金逐分钟记账：
 
 ```text
-ret_t = log(open_{t+h+1} / open_{t+1})
-position_t ∈ [0, 1]
-gross_pnl_t = position_t * ret_t
-turnover_t = abs(position_t - position_{t-1})
-cost_t = turnover_t * (fee_bps + slippage_bps) / 10000
-net_pnl_t = gross_pnl_t - cost_t
+signal_i ∈ [0, 1]
+target_weight_i = signal_i / N
+simple_return_i,t = open_i,t+2 / open_i,t+1 - 1
+cost = sum(abs(target_value_i - previous_value_i)) * (fee_bps + slippage_bps) / 10000
+post_trade_equity = previous_equity - cost
+target_value_i = target_weight_i * post_trade_equity
+cash = post_trade_equity - sum(target_value_i)
+next_equity = cash + sum(target_value_i * (1 + simple_return_i,t))
+portfolio_log_return = log(next_equity / previous_equity)
 ```
+
+成本与目标金额联立求解以保证自融资，现金不得为负。模型策略每分钟再平衡；
+买入持有基准仅在起点等权买入，之后权重随价格漂移。期末按市值计价，不假设卖出。
+回撤包含初始净值 1。不能平均资产对数收益来代替组合收益。
 
 当前训练标签使用：
 
@@ -250,7 +261,7 @@ ret_15m = log(close_t / close_{t-15})
 
 评测时必须同时报告无因子 baseline 和有因子模型，不能只报告有因子模型的绝对收益。否则无法判断收益来自模型结构、市场 beta，还是来自新增因子。
 
-当前推荐继续研究：
+历史候选配置（尚未通过修复后的评测）：
 
 ```text
 model = full_feature_tcn
@@ -472,7 +483,7 @@ cost_threshold_sensitivity.json
 
 ## 下游策略使用方式
 
-当前下游只建议消费 `full_feature_tcn_15m` 的预测结果，并在策略层增加换手约束。
+重新训练、重算基准并验证数据契约后，下游才能采用候选模型；文中 15m 只是历史候选。
 
 推荐的策略层约束：
 
@@ -536,6 +547,26 @@ capacity_ratio
 主实验成本敏感性已经显示：`full_feature_tcn_15m` 零成本为正，但加入 maker `8bps` 或 taker `10bps + 2bps slippage` 后会被高换手打穿。所以下一步真正要解决的是“降低换手”和“成本感知训练”。
 
 ## 复现检查
+
+修复后缓存格式为 `cache_version=2`。旧缓存必须用 `--rebuild-cache` 重建；
+缺少分钟或币种时会明确报错，需要先修复原始数据，不能补未来值或压缩时间。
+缓存记录原始 CSV / metadata 的 SHA256、参数和 schema；参数或数据变化会拒绝复用。
+训练/验证尾部按 `max(horizons)+1` 清除跨分区标签，因此分区有效样本数会改变。
+
+旧 checkpoint 没有训练数据契约，须重新训练后再打包。新包检查特征和 horizon 顺序、
+lookback、分区、来源及标准化参数；不能用旧权重搭配新缓存。OHLCV 和有因子包均支持。
+`--force` 先完成临时构建再替换；输入或构建失败保留旧目录和压缩包。
+
+运行离线回归测试（含小型 CPU 端到端实验）：
+
+```bash
+python3 -m pip install -e '.[test]'
+OMP_NUM_THREADS=1 python3 -m pytest -q
+```
+
+分币统计使用 `pnl_contribution`（初始总资金比例，含成本），合计等于组合总收益；
+`avg_weight` 表示实际组合权重。分月按收益结束时间归因。无法有限表示的年化收益或
+Calmar 输出 JSON `null`，报告显示 `N/A`；NaN/Inf 预测会直接拒绝回测。
 
 语法检查：
 

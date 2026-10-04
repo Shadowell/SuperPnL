@@ -12,6 +12,7 @@ import pandas as pd
 
 from superpnl.data import DatasetConfig, load_prepared_dataset, prepare_dataset
 from superpnl.provenance import validate_cache
+from superpnl.portfolio import simulate_portfolio
 from superpnl.training import (
     TrainConfig,
     backtest_buy_and_hold,
@@ -60,24 +61,31 @@ def split_datetime(dataset, split: str) -> tuple[str, str]:
     return ts[0].strftime("%Y-%m-%d %H:%M UTC"), ts[1].strftime("%Y-%m-%d %H:%M UTC")
 
 
-def by_symbol_summary(dataset, positions: np.ndarray, split: str) -> list[dict]:
+def by_symbol_summary(
+    dataset, positions: np.ndarray, split: str,
+    fixed_fee_bps: float = 0.0, fixed_slippage_bps: float = 0.0,
+) -> list[dict]:
     start, end = {
         "train": dataset.train_range,
         "val": dataset.val_range,
         "test": dataset.test_range,
     }[split]
     next_returns = dataset.next_returns[:, start:end].astype("float64")
+    # backtest_scores returns post-trade weights, so recover signals/N.
+    ledger = simulate_portfolio(
+        next_returns, np.clip(positions * dataset.n_symbols, 0.0, 1.0),
+        cost_rate=(fixed_fee_bps + fixed_slippage_bps) / 10_000.0,
+    )
     out = []
     for i, symbol in enumerate(dataset.symbols):
-        log_sum = float(np.nansum(positions[i] * next_returns[i]))
         out.append(
             {
                 "symbol": symbol,
-                "total_return": float(np.exp(log_sum) - 1.0),
-                "avg_position": float(np.nanmean(positions[i])),
+                "pnl_contribution": float(ledger.pnl_by_symbol[i].sum()),
+                "avg_weight": float(ledger.positions[i].mean()) if positions.shape[1] else 0.0,
             }
         )
-    return sorted(out, key=lambda item: item["total_return"], reverse=True)
+    return sorted(out, key=lambda item: item["pnl_contribution"], reverse=True)
 
 
 def by_month_summary(dataset, portfolio_returns: np.ndarray, split: str) -> list[dict]:
@@ -86,7 +94,7 @@ def by_month_summary(dataset, portfolio_returns: np.ndarray, split: str) -> list
         "val": dataset.val_range,
         "test": dataset.test_range,
     }[split]
-    ts = pd.to_datetime(dataset.timestamps[start:end], unit="ms", utc=True)
+    ts = pd.to_datetime(dataset.timestamps[start + 2:end + 2], unit="ms", utc=True)
     frame = pd.DataFrame({"month": ts.strftime("%Y-%m"), "ret": portfolio_returns})
     rows = []
     for month, group in frame.groupby("month"):
@@ -183,7 +191,7 @@ def write_report(out_dir: Path, dataset, results: dict) -> None:
         report.append("")
         report.append("Top symbols:")
         for row in stability["by_symbol_top"][:10]:
-            report.append(f"- `{row['symbol']}` total_return={row['total_return']:.4f}, avg_pos={row['avg_position']:.4f}")
+            report.append(f"- `{row['symbol']}` pnl_contribution={row['pnl_contribution']:.4f}, avg_weight={row['avg_weight']:.4f}")
         report.append("")
         report.append("Monthly returns:")
         for row in stability["by_month"]:
@@ -279,7 +287,9 @@ def main() -> None:
             results["backtests"][key] = metrics
             if name == "full_feature_tcn":
                 results["stability"][key] = {
-                    "by_symbol_top": by_symbol_summary(dataset, positions, "test"),
+                    "by_symbol_top": by_symbol_summary(
+                        dataset, positions, "test", args.fixed_fee_bps, args.fixed_slippage_bps
+                    ),
                     "by_month": by_month_summary(dataset, portfolio_returns, "test"),
                 }
         np.savez_compressed(out_dir / f"{name}_test_predictions.npz", pred=pred, true=true, pos_score=pos_score)
@@ -308,7 +318,7 @@ def main() -> None:
         }
 
     results["elapsed_sec"] = time.time() - started
-    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2) + "\n")
+    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
     write_report(out_dir, dataset, results)
     print(f"wrote {out_dir / 'REPORT.md'}", flush=True)
 

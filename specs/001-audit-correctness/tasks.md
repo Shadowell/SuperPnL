@@ -21,8 +21,8 @@
 
 ## Phase 4: Completion
 - [x] T012 修复 #11 pyproject.toml matplotlib 依赖，验证绘图 CLI。
-- [ ] T013 同步 README.md 和 docs/ 口径，标记历史结果需重算；添加并运行 CPU CLI 集成测试。
-- [ ] T014 全量测试、独立审查、converge 与 git diff --check；确保每 issue 独立 commit。
+- [x] T013 同步 README.md 和 docs/ 口径，标记历史结果需重算；添加并运行 CPU CLI 集成测试。
+- [x] T014 全量测试、独立审查、converge 与 git diff --check；确保每 issue 独立 commit。
 
 ## Dependencies & Execution Order
 T002→T003→T004→T008；T005→T006→T007；T009→T010。
@@ -32,6 +32,6 @@ T011 依赖 T008、T007、T010；T012 可独立；T013/T014 最后。
 ## Phase 5: Convergence
 - [x] T015 修复 #12 metrics.py 年化溢出、run_superpnl_experiment.py unavailable显示，tests/test_metrics.py/test_reporting.py。
 - [x] T016 修复 #13 training.py非有限预测和阈值拒绝，tests/test_backtest.py。
-- [ ] T017 修正 #1/#2 分月结束时间与分币净贡献归因，scripts/run_superpnl_experiment.py、tests/test_reporting.py。
+- [x] T017 修正 #1/#2 分月结束时间与分币净贡献归因，scripts/run_superpnl_experiment.py、tests/test_reporting.py。
 - [x] T018 修复 #5/#8 缓存顶层schema/config矛盾及数组形状检查，provenance.py/data.py回归105项通过。
 - [x] T019 修复 #12 常量float32截面相关系数NaN，metrics.py/test_metrics.py回归通过。
