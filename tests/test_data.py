@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from superpnl.data import DatasetConfig, prepare_dataset
+from superpnl.data import DatasetConfig, load_raw_bars, prepare_dataset
 
 
 def make_raw_frame(n: int = 300) -> pd.DataFrame:
@@ -89,3 +90,85 @@ def test_dataset_rejects_empty_split_after_label_purge(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="empty.*split.*purge"):
         prepare_dataset(config)
+
+
+@pytest.mark.parametrize("both_symbols", [False, True])
+def test_raw_bars_reject_missing_minutes_even_with_low_coverage_threshold(
+    tmp_path: Path, both_symbols: bool
+) -> None:
+    frame = make_raw_frame()
+    write_raw_frame(tmp_path, frame.iloc[::2] if both_symbols else frame)
+    write_raw_frame(tmp_path, frame.iloc[::2], "ETH-USDT")
+
+    with pytest.raises(ValueError, match="one-minute grid"):
+        load_raw_bars(tmp_path, min_coverage=0.1)
+
+
+def test_raw_bars_require_every_metadata_symbol(tmp_path: Path) -> None:
+    write_raw_frame(tmp_path, make_raw_frame())
+    (tmp_path / "metadata.json").write_text(json.dumps({"symbols": ["BTC-USDT", "ETH-USDT"]}))
+
+    with pytest.raises(FileNotFoundError, match="ETH-USDT"):
+        load_raw_bars(tmp_path)
+
+
+@pytest.mark.parametrize("boundary", ["start_ms", "end_ms"])
+def test_raw_bars_enforce_declared_time_boundaries(tmp_path: Path, boundary: str) -> None:
+    frame = make_raw_frame()
+    write_raw_frame(tmp_path, frame.iloc[1:-1])
+    value = int(frame.timestamp.iloc[0 if boundary == "start_ms" else -1])
+    (tmp_path / "metadata.json").write_text(json.dumps({boundary: value}))
+
+    with pytest.raises(ValueError, match=boundary):
+        load_raw_bars(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("close", np.nan), ("open", np.inf), ("close", 0.0), ("low", -1.0), ("volume", -1.0), ("amount", -1.0)],
+)
+def test_raw_bars_reject_invalid_values_without_dropping_rows(
+    tmp_path: Path, column: str, value: float
+) -> None:
+    frame = make_raw_frame()
+    frame.loc[50, column] = value
+    write_raw_frame(tmp_path, frame)
+
+    with pytest.raises(ValueError, match="invalid OHLCV"):
+        load_raw_bars(tmp_path)
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "off_minute", "different_extent", "bad_ohlc"])
+def test_raw_bars_reject_ambiguous_timeline_or_candles(tmp_path: Path, corruption: str) -> None:
+    frame = make_raw_frame()
+    write_raw_frame(tmp_path, frame)
+    bad = frame.copy()
+    if corruption == "duplicate":
+        bad = pd.concat([bad, bad.iloc[[50]]], ignore_index=True)
+    elif corruption == "off_minute":
+        bad.loc[50, "timestamp"] += 1
+    elif corruption == "different_extent":
+        bad = bad.iloc[1:]
+    else:
+        bad.loc[50, "high"] = bad.loc[50, "low"] - 1
+    write_raw_frame(tmp_path, bad, "ETH-USDT")
+
+    with pytest.raises(ValueError):
+        load_raw_bars(tmp_path)
+
+
+def test_raw_bars_keep_complete_minutes_and_symbol_order(tmp_path: Path) -> None:
+    frame = make_raw_frame()
+    write_raw_frame(tmp_path, frame)
+    write_raw_frame(tmp_path, frame, "ETH-USDT")
+    metadata = {
+        "symbols": ["ETH-USDT", "BTC-USDT"],
+        "start_ms": int(frame.timestamp.iloc[0]),
+        "end_ms": int(frame.timestamp.iloc[-1]),
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata))
+    symbols, frames = load_raw_bars(tmp_path)
+
+    assert symbols == metadata["symbols"]
+    for symbol in symbols:
+        pd.testing.assert_frame_equal(frames[symbol], frame)

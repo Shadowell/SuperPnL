@@ -8,7 +8,7 @@
 ## Phase 2: US1 / US2 回测和数据
 - [x] T002 [P] [US2] 修复 #1 src/superpnl/data.py 下一开盘收益，tests/test_data.py 验证跳空。
 - [x] T003 [US2] 修复 #3 src/superpnl/data.py 分区 purge，测试未来价格扰动。
-- [ ] T004 [US2] 修复 #4 src/superpnl/data.py 分钟网格校验，测试缺口与缺失币种。
+- [x] T004 [US2] 修复 #4 src/superpnl/data.py 分钟网格校验，测试缺口与缺失币种。
 - [x] T005 [P] [US1] 修复 #6 src/superpnl/metrics.py 初始净值回撤，tests/test_metrics.py。
 - [ ] T006 [US1] 修复 #2 src/superpnl/training.py 组合账本，tests/test_backtest.py；同步分币归因。
 - [ ] T007 [US1] 修复 #7 src/superpnl/training.py 动量反标准化及阈值测试。
