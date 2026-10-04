@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -220,7 +221,7 @@ def backtest_rule_momentum(
     fixed_fee_bps: float = 0.0,
     fixed_slippage_bps: float = 0.0,
 ) -> dict:
-    # Use ret_30m feature if present; otherwise fallback to first feature.
+    # Keep the same raw-return rule for every prediction horizon.
     start, end = {
         "train": dataset.train_range,
         "val": dataset.val_range,
@@ -229,8 +230,26 @@ def backtest_rule_momentum(
     try:
         feature_idx = dataset.feature_names.index("ret_30m")
     except ValueError:
-        feature_idx = 0
-    score = dataset.feature_inputs[:, start:end, feature_idx]
+        candidates = [
+            (int(match.group(1)), idx)
+            for idx, feature in enumerate(dataset.feature_names)
+            if (match := re.fullmatch(r"ret_([1-9][0-9]*)m", feature)) is not None
+        ]
+        if not candidates:
+            raise ValueError("momentum baseline requires an available ret_{window}m return feature")
+        _, feature_idx = max(candidates)
+    if dataset.feature_mean is None or dataset.feature_std is None:
+        raise ValueError("momentum baseline requires training feature normalization statistics")
+    means = np.asarray(dataset.feature_mean)
+    stds = np.asarray(dataset.feature_std)
+    expected_shape = (len(dataset.feature_names),)
+    if means.shape != expected_shape or stds.shape != expected_shape:
+        raise ValueError("feature normalization statistics do not match the feature schema")
+    mean = float(means[feature_idx])
+    std = float(stds[feature_idx])
+    if not np.isfinite(mean) or not np.isfinite(std) or std <= 0.0:
+        raise ValueError("momentum feature normalization statistics must be finite with positive std")
+    score = dataset.feature_inputs[:, start:end, feature_idx].astype("float64") * std + mean
     return backtest_scores(
         dataset,
         pred=score[:, :, None],

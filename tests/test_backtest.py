@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from superpnl.training import backtest_buy_and_hold, backtest_scores
+from superpnl.training import backtest_buy_and_hold, backtest_rule_momentum, backtest_scores
 
 
 def make_dataset(gross_returns):
@@ -92,3 +92,59 @@ def test_invalid_cost_rate_is_rejected(cost_rate):
 
     with pytest.raises(ValueError, match="cost_rate"):
         simulate_portfolio(np.zeros((1, 1)), np.ones((1, 1)), cost_rate=cost_rate)
+
+
+def momentum_dataset(raw_return, mean, std, feature_name="ret_30m"):
+    dataset = make_dataset([[1.0]])
+    dataset.feature_names = ["rsi_5m", feature_name]
+    dataset.feature_mean = np.array([0.0, mean])
+    dataset.feature_std = np.array([1.0, std])
+    dataset.feature_inputs = np.array([[[1.0, (raw_return - mean) / std]]])
+    return dataset
+
+
+@pytest.mark.parametrize(
+    ("raw_return", "mean", "std", "threshold_bps", "expected_position"),
+    [(0.01, 0.02, 0.01, 0.0, 1.0), (0.0003, 0.0, 0.0001, 5.0, 0.0)],
+)
+def test_momentum_compares_raw_returns_with_bps_threshold(
+    raw_return, mean, std, threshold_bps, expected_position
+):
+    dataset = momentum_dataset(raw_return, mean, std)
+
+    metrics = backtest_rule_momentum(dataset, "test", 0, threshold_bps=threshold_bps)
+
+    assert metrics["average_position"] == pytest.approx(expected_position)
+
+
+def test_momentum_falls_back_to_an_available_return_feature():
+    dataset = momentum_dataset(-0.01, 0.0, 0.01, feature_name="ret_5m")
+
+    metrics = backtest_rule_momentum(dataset, "test", 0)
+
+    assert metrics["average_position"] == 0.0
+
+
+def test_momentum_rule_is_reused_for_every_model_horizon():
+    dataset = momentum_dataset(0.01, 0.02, 0.01)
+
+    metrics = [backtest_rule_momentum(dataset, "test", head) for head in (0, 1, 2)]
+
+    assert metrics[0] == metrics[1] == metrics[2]
+    assert metrics[2]["average_position"] == 1.0
+
+
+@pytest.mark.parametrize("missing_stat", ["feature_mean", "feature_std"])
+def test_momentum_rejects_missing_training_normalization(missing_stat):
+    dataset = momentum_dataset(0.01, 0.0, 0.01)
+    setattr(dataset, missing_stat, None)
+
+    with pytest.raises(ValueError, match="normalization"):
+        backtest_rule_momentum(dataset, "test", 0)
+
+
+def test_momentum_rejects_schema_without_return_features():
+    dataset = momentum_dataset(0.01, 0.0, 0.01, feature_name="vol_std_30m")
+
+    with pytest.raises(ValueError, match="return feature"):
+        backtest_rule_momentum(dataset, "test", 0)

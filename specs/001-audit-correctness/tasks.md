@@ -11,7 +11,7 @@
 - [x] T004 [US2] 修复 #4 src/superpnl/data.py 分钟网格校验，测试缺口与缺失币种。
 - [x] T005 [P] [US1] 修复 #6 src/superpnl/metrics.py 初始净值回撤，tests/test_metrics.py。
 - [x] T006 [US1] 修复 #2 src/superpnl/training.py 组合账本，tests/test_backtest.py；同步分币归因。
-- [ ] T007 [US1] 修复 #7 src/superpnl/training.py 动量反标准化及阈值测试。
+- [x] T007 [US1] 修复 #7 src/superpnl/training.py 动量反标准化及阈值测试。
 - [x] T008 [US2] 修复 #8 data.py 与 run_superpnl_experiment.py 的缓存版本、配置及源指纹校验，tests/test_cache.py。
 
 ## Phase 3: US3 模型交付
