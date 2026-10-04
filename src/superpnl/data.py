@@ -227,7 +227,8 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
             exit_ = open_.shift(-(horizon + 1))
             labels.append(np.log(exit_ / entry.replace(0, np.nan)).to_numpy(dtype="float32"))
         labels_arr = np.stack(labels, axis=-1)
-        next_return = np.log(close.shift(-1) / close.replace(0, np.nan)).to_numpy(dtype="float32")
+        # A signal formed at t close enters at t+1 open and earns t+1 -> t+2.
+        next_return = np.log(open_.shift(-2) / open_.shift(-1).replace(0, np.nan)).to_numpy(dtype="float32")
         realized_horizon_blocks.append(labels_arr)
         label_blocks.append(labels_arr)
         next_return_blocks.append(next_return)
