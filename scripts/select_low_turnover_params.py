@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from superpnl.data import load_prepared_dataset
+from superpnl.portfolio import simulate_weight_portfolio
+from superpnl.provenance import prepared_data_contract
 from superpnl.training import (
     LowTurnoverConfig,
     backtest_buy_and_hold,
@@ -74,6 +76,8 @@ def safe_number(value):
 
 def compact_metrics(metrics: dict) -> dict:
     keys = [
+        "total_return",
+        "annualized_return",
         "net_total_return",
         "gross_total_return",
         "cost_return",
@@ -101,7 +105,10 @@ def compact_metrics(metrics: dict) -> dict:
         "fixed_fee_bps",
         "fixed_slippage_bps",
     ]
-    return {key: safe_number(metrics[key]) for key in keys if key in metrics}
+    result = {key: safe_number(metrics[key]) for key in keys if key in metrics}
+    if "net_total_return" not in result and "total_return" in result:
+        result["net_total_return"] = result["total_return"]
+    return result
 
 
 def split_range(dataset, split: str) -> tuple[int, int]:
@@ -112,36 +119,56 @@ def split_range(dataset, split: str) -> tuple[int, int]:
     }[split]
 
 
+def load_predictions(path: Path, dataset, split: str) -> np.ndarray:
+    """Only score complete predictions bound to this exact prepared dataset."""
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            contract = json.loads(str(saved["data_contract"].item()))
+            pred = saved["pred"]
+    except (KeyError, ValueError, TypeError) as error:
+        raise ValueError(f"Invalid prediction artifact {path}; regenerate predictions with a data contract") from error
+    if contract != prepared_data_contract(dataset):
+        raise ValueError(f"prediction data contract mismatch: {path}; regenerate with the matching cache")
+    start, end = split_range(dataset, split)
+    expected = (dataset.n_symbols, end - start, len(dataset.horizons))
+    if pred.shape != expected or not np.isfinite(pred).all():
+        raise ValueError(f"prediction array must be finite with {split} shape {expected}: {path}")
+    return pred
+
+
 def by_symbol_summary(
     dataset,
     positions: np.ndarray,
     split: str,
     fixed_fee_bps: float,
     fixed_slippage_bps: float,
+    rebalance_interval_bars: int = 1,
 ) -> list[dict]:
     start, end = split_range(dataset, split)
     next_returns = dataset.next_returns[:, start:end].astype("float64")
     cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
-    turnover = np.abs(np.diff(positions, axis=1, prepend=0.0))
+    rebalance_mask = np.arange(end - start) % max(1, rebalance_interval_bars) == 0
+    ledger = simulate_weight_portfolio(next_returns, positions, cost, rebalance_mask)
     rows = []
     for i, symbol in enumerate(dataset.symbols):
-        gross_log_sum = float(np.nansum(positions[i] * next_returns[i]))
-        net_log_sum = float(np.nansum(positions[i] * next_returns[i] - turnover[i] * cost))
+        contribution = float(ledger.pnl_by_symbol[i].sum())
+        cost_contribution = float(ledger.costs[i].sum())
         rows.append(
             {
                 "symbol": symbol,
-                "gross_total_return": float(np.exp(gross_log_sum) - 1.0),
-                "net_total_return": float(np.exp(net_log_sum) - 1.0),
-                "avg_position": float(np.nanmean(positions[i])),
-                "trade_count": int((turnover[i] > 1e-6).sum()),
+                "pnl_contribution": contribution,
+                "gross_pnl_contribution": contribution + cost_contribution,
+                "cost_contribution": cost_contribution,
+                "avg_position": float(ledger.positions[i].mean()),
+                "trade_count": int((ledger.traded_notional[i] > 1e-12).sum()),
             }
         )
-    return sorted(rows, key=lambda row: row["net_total_return"], reverse=True)
+    return sorted(rows, key=lambda row: row["pnl_contribution"], reverse=True)
 
 
 def by_month_summary(dataset, portfolio_returns: np.ndarray, split: str) -> list[dict]:
     start, end = split_range(dataset, split)
-    timestamps = pd.to_datetime(dataset.timestamps[start:end], unit="ms", utc=True)
+    timestamps = pd.to_datetime(dataset.timestamps[start + 2:end + 2], unit="ms", utc=True)
     frame = pd.DataFrame({"month": timestamps.strftime("%Y-%m"), "ret": portfolio_returns})
     rows = []
     for month, group in frame.groupby("month"):
@@ -233,6 +260,7 @@ def main() -> None:
             "horizons": list(dataset.horizons),
             "val_range": list(dataset.val_range),
             "test_range": list(dataset.test_range),
+            "data_contract": prepared_data_contract(dataset),
         },
         "cost_assumption": {
             "fixed_fee_bps": args.fixed_fee_bps,
@@ -268,8 +296,8 @@ def main() -> None:
         if not test_path.exists():
             raise FileNotFoundError(f"missing test predictions: {test_path}")
 
-        val_pred = np.load(val_path)["pred"]
-        test_pred = np.load(test_path)["pred"]
+        val_pred = load_predictions(val_path, dataset, "val")
+        test_pred = load_predictions(test_path, dataset, "test")
         thresholds = model_thresholds(model_name, args)
         total = (
             len(thresholds)
@@ -383,13 +411,15 @@ def main() -> None:
             "attribution": {
                 "val": {
                     "by_symbol": by_symbol_summary(
-                        dataset, val_positions, "val", args.fixed_fee_bps, args.fixed_slippage_bps
+                        dataset, val_positions, "val", args.fixed_fee_bps, args.fixed_slippage_bps,
+                        selected_config.rebalance_interval_bars,
                     ),
                     "by_month": by_month_summary(dataset, val_returns, "val"),
                 },
                 "test": {
                     "by_symbol": by_symbol_summary(
-                        dataset, test_positions, "test", args.fixed_fee_bps, args.fixed_slippage_bps
+                        dataset, test_positions, "test", args.fixed_fee_bps, args.fixed_slippage_bps,
+                        selected_config.rebalance_interval_bars,
                     ),
                     "by_month": by_month_summary(dataset, test_returns, "test"),
                 },
@@ -409,7 +439,7 @@ def main() -> None:
         )
 
     results["elapsed_sec"] = time.time() - started_all
-    report_path.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
+    report_path.write_text(json.dumps(results, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     print(f"saved {report_path}", flush=True)
 
 

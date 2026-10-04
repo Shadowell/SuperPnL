@@ -16,3 +16,8 @@
 SuperPnL 不以 K 线预测误差作为最终目标。项目长期定位是研究所有直接面向 PnL 的预测模型；当前阶段只针对现货市场，使用历史 OHLCV 和外生因子，预测可交易 edge，并输出 `0..1` 的现货目标仓位。
 
 第一版不做永续、杠杆、借币做空、盘口建模、实盘交易或在线服务。K 线路径预测可以作为辅助任务，但最终评测以 PnL、风险调整收益、回撤和换手为核心。
+
+## 开发流程
+
+使用 Spec Kit 1.0.6：specify → clarify → plan → tasks → analyze → implement → converge。
+项目原则见 .specify/memory/constitution.md，任务规格见 specs/；不自动推送或部署。

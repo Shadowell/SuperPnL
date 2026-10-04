@@ -12,6 +12,10 @@ tags:
 
 # SuperPnL
 
+> **2026-10-05 审查修复后状态：** 本文的原版实验数字、图表和 15m 推荐属于修复前历史记录。
+> 原评测存在成交时点、组合记账和分区标签隔离错误，不能据此证明模型有效。
+> 必须先重建缓存、重新训练并重算所有基准；本轮未重跑真实历史实验，也未更新外部模型仓库。
+
 SuperPnL 是一个面向可交易 PnL 的加密货币现货预测模型。当前上传的是第一版 OKX spot Top20 / 1min K 线模型包，推荐只使用 `15m` horizon 的实时推理结果。
 
 Hugging Face repo:
@@ -191,3 +195,10 @@ BitPro broker / execution
 ```
 
 历史 prediction `.npz` 文件没有上传到 Hugging Face，也不应作为模拟盘或实盘信号源。
+
+## 修复后的模型包兼容边界
+打包器拒绝没有 `checkpoint.data_contract` 的旧权重，也拒绝和缓存不一致的契约。
+新 `data_contract.json.training_data_contract` 包含数据来源指纹、特征/horizon顺序、
+分区、lookback和归一化哈希。需要重新准备完整分钟数据、重训、重评测后生成新包；
+本轮只验证临时小样本产物，未替换本文提到的外部历史模型包。
+OHLCV 包 `use_features=false, feature_dim=0`，不传因子输入；有因子包要求完整因子输入。

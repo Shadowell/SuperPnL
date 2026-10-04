@@ -4,12 +4,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import torch
+
+from superpnl.model import SuperPnLModel
+from superpnl.provenance import cache_data_contract
 
 
 BAR_FEATURE_NAMES = [
@@ -67,11 +73,51 @@ def build_metrics_summary(metrics: dict, model_name: str, live_horizon: str) -> 
 
 
 def make_tarball(package_dir: Path) -> Path:
-    tar_path = package_dir.with_suffix(".tar.gz")
-    if tar_path.exists():
-        tar_path.unlink()
+    tar_path = package_dir.with_name(package_dir.name + ".tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(package_dir, arcname=package_dir.name)
+    return tar_path
+
+
+class PackageRecoveryError(RuntimeError):
+    """Keep the staging directory when a filesystem failure prevents rollback."""
+
+
+def publish_package(staged_package: Path, package_dir: Path, staging_root: Path) -> Path:
+    tar_path = package_dir.with_name(package_dir.name + ".tar.gz")
+    staged_tar = staged_package.with_name(staged_package.name + ".tar.gz")
+    replacements = [(staged_package, package_dir), (staged_tar, tar_path)]
+    backups = []
+    installed = []
+    try:
+        for index, (_, destination) in enumerate(replacements):
+            if destination.exists():
+                backup = staging_root / f"previous-{index}"
+                os.replace(destination, backup)
+                backups.append((backup, destination))
+        for source, destination in replacements:
+            os.replace(source, destination)
+            installed.append(destination)
+    except BaseException as error:
+        recovery_errors = []
+        for path in reversed(installed):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError as recovery_error:
+                recovery_errors.append(recovery_error)
+        for backup, destination in reversed(backups):
+            try:
+                os.replace(backup, destination)
+            except OSError as recovery_error:
+                recovery_errors.append(recovery_error)
+        if recovery_errors:
+            raise PackageRecoveryError(
+                f"Package replacement failed and rollback needs recovery from {staging_root}"
+            ) from error
+        raise
     return tar_path
 
 
@@ -97,21 +143,77 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
+    run_dir = Path(args.run_dir).resolve()
+    cache_dir = Path(args.cache_dir).resolve()
+    package_dir = Path(args.package_dir).absolute()
+    tar_path = package_dir.with_name(package_dir.name + ".tar.gz")
+    for destination in (package_dir, tar_path):
+        if destination.is_symlink():
+            raise ValueError(f"Output must not be a symlink: {destination}")
+        resolved = destination.resolve()
+        for source in (run_dir, cache_dir):
+            if resolved == source or resolved in source.parents or source in resolved.parents:
+                raise ValueError(f"Output {destination} overlaps input directory {source}")
+        if destination.exists() and not args.force:
+            raise FileExistsError(f"{destination} exists; pass --force to overwrite")
+    if package_dir.exists() and not package_dir.is_dir():
+        raise ValueError(f"Package output must be a directory: {package_dir}")
+    if tar_path.exists() and not tar_path.is_file():
+        raise ValueError(f"Archive output must be a file: {tar_path}")
+    required = [
+        run_dir / f"{args.model_name}.pt", run_dir / "metrics.json", cache_dir / "metadata.json",
+        *(cache_dir / f"{name}.npy" for name in ("bar_mean", "bar_std", "feature_mean", "feature_std")),
+    ]
+    for source in required:
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        for destination in (package_dir.resolve(), tar_path.resolve()):
+            if destination == source.resolve() or destination in source.resolve().parents:
+                raise ValueError(f"Output {destination} overlaps input file {source}")
+    package_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=f".{package_dir.name}.build-", dir=package_dir.parent))
+    preserve_recovery = False
+    try:
+        staged_parent = staging_root / "new"
+        staged_parent.mkdir()
+        staged_package = staged_parent / package_dir.name
+        build_package(args, staged_package)
+        tar_path = publish_package(staged_package, package_dir, staging_root)
+    except PackageRecoveryError:
+        preserve_recovery = True
+        raise
+    finally:
+        if not preserve_recovery:
+            shutil.rmtree(staging_root)
+    print(json.dumps({"package_dir": str(package_dir), "tarball": str(tar_path)}, indent=2))
+
+
+def build_package(args: argparse.Namespace, package_dir: Path) -> None:
     run_dir = Path(args.run_dir)
     cache_dir = Path(args.cache_dir)
-    package_dir = Path(args.package_dir)
+    package_dir.mkdir()
 
-    if package_dir.exists():
-        if not args.force:
-            raise FileExistsError(f"{package_dir} exists; pass --force to overwrite")
-        shutil.rmtree(package_dir)
-    package_dir.mkdir(parents=True)
-
-    run_config = read_json(run_dir / "run_config.json")
     cache_metadata = read_json(cache_dir / "metadata.json")
     metrics = read_json(run_dir / "metrics.json")
 
     model_src = run_dir / f"{args.model_name}.pt"
+    checkpoint = torch.load(model_src, map_location="cpu", weights_only=True)
+    training_data_contract = checkpoint.get("data_contract")
+    if not training_data_contract:
+        raise ValueError("Checkpoint has no data contract; rebuild the dataset cache and retrain")
+    if training_data_contract != cache_data_contract(cache_dir):
+        raise ValueError("Checkpoint/cache data contract mismatch; use the matching cache or retrain")
+    state = checkpoint["model"]
+    use_features = checkpoint["use_features"]
+    architecture = {
+        "use_features": use_features,
+        "bar_dim": int(state["bar_encoder.proj.weight"].shape[1]),
+        "feature_dim": int(state["feature_encoder.proj.weight"].shape[1]) if use_features else 0,
+        "num_horizons": int(state["head.4.weight"].shape[0]) // 2,
+        "hidden_dim": int(state["bar_encoder.proj.weight"].shape[0]),
+        "dropout": float(checkpoint["config"]["dropout"]),
+    }
+    SuperPnLModel(**architecture).load_state_dict(state)
     model_dst = package_dir / "model.pt"
     copy_required(model_src, model_dst)
 
@@ -132,22 +234,20 @@ def main() -> None:
     model_config = {
         "model_class": "superpnl.model.SuperPnLModel",
         "model_name": args.model_name,
-        "use_features": True,
-        "bar_dim": int(cache_metadata["bar_dim"]),
-        "feature_dim": int(cache_metadata["feature_dim"]),
-        "num_horizons": len(horizons),
-        "hidden_dim": int(run_config["train_config"]["hidden_dim"]),
-        "dropout": float(run_config["train_config"].get("dropout", 0.05)),
+        **architecture,
         "lookback": int(cache_metadata["lookback"]),
         "horizons": horizons,
         "horizon_index": {f"{h}m": i for i, h in enumerate(horizons)},
         "recommended_horizon": args.recommended_horizon,
         "recommended_horizon_index": horizons.index(recommended_horizon_minutes),
         "input_shapes": {
-            "bar": ["batch", int(cache_metadata["lookback"]), int(cache_metadata["bar_dim"])],
-            "features": ["batch", int(cache_metadata["lookback"]), int(cache_metadata["feature_dim"])],
+            "bar": ["batch", int(cache_metadata["lookback"]), architecture["bar_dim"]],
         },
     }
+    if use_features:
+        model_config["input_shapes"]["features"] = [
+            "batch", int(cache_metadata["lookback"]), architecture["feature_dim"],
+        ]
 
     feature_schema = {
         "bar_feature_names": BAR_FEATURE_NAMES,
@@ -180,6 +280,7 @@ def main() -> None:
     }
 
     data_contract = {
+        "training_data_contract": training_data_contract,
         "decision_time": "At confirmed 1m bar t, generate features from bars <= t.",
         "entry_exit_label_used_in_training": "label_h = log(open_{t+h+1} / open_{t+1})",
         "live_prediction_output": {
@@ -256,8 +357,7 @@ Historical prediction `.npz` files are intentionally not part of this package. T
     }
     write_json(package_dir / "manifest.json", manifest)
 
-    tar_path = make_tarball(package_dir)
-    print(json.dumps({"package_dir": str(package_dir), "tarball": str(tar_path)}, indent=2))
+    make_tarball(package_dir)
 
 
 if __name__ == "__main__":

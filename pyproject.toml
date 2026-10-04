@@ -7,6 +7,7 @@ dependencies = [
   "numpy",
   "pandas",
   "torch",
+  "matplotlib",
   "lightgbm",
 ]
 
@@ -16,3 +17,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

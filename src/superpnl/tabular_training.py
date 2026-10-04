@@ -11,6 +11,7 @@ import numpy as np
 
 from .data import PreparedDataset
 from .metrics import rank_ic_by_time, regression_metrics
+from .provenance import prepared_data_contract
 from .training import TrainConfig
 
 
@@ -37,7 +38,7 @@ class LightGBMTrainConfig:
     seed: int = 17
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        return json.dumps(asdict(self), indent=2, allow_nan=False)
 
 
 class LightGBMWrapper:
@@ -46,34 +47,65 @@ class LightGBMWrapper:
         models: dict[int, lgb.Booster],
         horizons: tuple[int, ...],
         objective: str = "rank_regression",
+        data_contract: dict | None = None,
+        num_threads: int = 1,
     ):
         self.models = models
         self.horizons = horizons
         self.objective = objective
+        self.data_contract = data_contract
+        self.num_threads = num_threads
 
     def predict(self, features: np.ndarray) -> np.ndarray:
+        if not self.data_contract:
+            raise ValueError("LightGBM model has no data contract; retrain the model")
+        if (features.ndim != 2 or features.shape[1] != self.data_contract["feature_dim"]
+                or not np.isfinite(features).all()):
+            raise ValueError("LightGBM features must be finite and match the data contract")
         preds = []
         for i, _ in enumerate(self.horizons):
-            preds.append(self.models[i].predict(features, num_iteration=self.models[i].best_iteration))
-        return np.stack(preds, axis=-1)
+            preds.append(self.models[i].predict(
+                features, num_iteration=self.models[i].best_iteration, num_threads=self.num_threads,
+            ))
+        result = np.stack(preds, axis=-1)
+        if not np.isfinite(result).all():
+            raise ValueError("LightGBM predictions must be finite")
+        return result
 
     def save(self, path: Path, name: str = "lightgbm_trader") -> None:
+        if not self.data_contract:
+            raise ValueError("LightGBM model has no data contract; retrain the model")
         path.mkdir(parents=True, exist_ok=True)
         for i, horizon in enumerate(self.horizons):
             self.models[i].save_model(str(path / f"{name}_{horizon}m.txt"))
-        metadata = {"horizons": list(self.horizons), "objective": self.objective}
-        (path / f"{name}_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        metadata = {
+            "model_type": "lightgbm", "horizons": list(self.horizons), "objective": self.objective,
+            "data_contract": self.data_contract, "num_threads": self.num_threads,
+            "output_kind": "rank_score" if self.objective in {"rank_regression", "lambdarank", "rank_xendcg"} else "log_return",
+        }
+        (path / f"{name}_metadata.json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
 
     @classmethod
     def load(cls, path: Path, horizons: tuple[int, ...], name: str = "lightgbm_trader") -> LightGBMWrapper:
         metadata_path = path / f"{name}_metadata.json"
-        objective = "rank_regression"
-        if metadata_path.exists():
-            objective = json.loads(metadata_path.read_text()).get("objective", objective)
+        if not metadata_path.exists():
+            raise ValueError("LightGBM metadata/data contract missing; retrain the model")
+        metadata = json.loads(metadata_path.read_text())
+        if metadata.get("model_type") != "lightgbm" or not metadata.get("data_contract"):
+            raise ValueError("LightGBM data contract missing or unsupported model type; retrain the model")
+        data_contract = metadata["data_contract"]
+        if list(horizons) != metadata.get("horizons") or list(horizons) != data_contract.get("horizons"):
+            raise ValueError("LightGBM horizon order does not match the saved data contract")
+        objective = metadata["objective"]
+        num_threads = int(metadata.get("num_threads", 1))
+        if num_threads <= 0:
+            raise ValueError("LightGBM num_threads must be positive")
         models = {}
         for i, horizon in enumerate(horizons):
             models[i] = lgb.Booster(model_file=str(path / f"{name}_{horizon}m.txt"))
-        return cls(models, horizons, objective=objective)
+            if models[i].num_feature() != data_contract["feature_dim"]:
+                raise ValueError("LightGBM model feature count does not match the data contract")
+        return cls(models, horizons, objective=objective, data_contract=data_contract, num_threads=num_threads)
 
 
 def _split_range(dataset: PreparedDataset, split: str) -> tuple[int, int]:
@@ -126,6 +158,8 @@ def _build_split_matrix(
     absolute_times = start + local_times
     features = dataset.feature_inputs[:, absolute_times, :].astype("float32")
     labels = dataset.labels[:, absolute_times, horizon_index].astype("float32")
+    if not np.isfinite(features).all() or not np.isfinite(labels).all():
+        raise ValueError("LightGBM training features and labels must be finite")
 
     x_time_major = np.transpose(features, (1, 0, 2)).reshape(-1, dataset.feature_dim)
     y_time_major = labels.T.reshape(-1)
@@ -134,6 +168,11 @@ def _build_split_matrix(
 
 
 def _lgb_params(config: LightGBMTrainConfig) -> dict:
+    num_threads = config.num_threads
+    if num_threads is None:
+        num_threads = int(os.environ.get("LGB_NUM_THREADS", max(1, (os.cpu_count() or 4) - 1)))
+    if num_threads <= 0:
+        raise ValueError("LightGBM num_threads must be positive")
     objective = config.objective
     metric = config.metric
     if objective == "rank_regression":
@@ -156,8 +195,7 @@ def _lgb_params(config: LightGBMTrainConfig) -> dict:
         "max_bin": config.max_bin,
         "verbosity": -1,
         "seed": config.seed,
-        "num_threads": config.num_threads
-        or max(1, (os.cpu_count() or 4) - 1),
+        "num_threads": num_threads,
     }
     if objective in {"lambdarank", "rank_xendcg"}:
         params["label_gain"] = [float((1 << i) - 1) for i in range(max(2, config.rank_bins))]
@@ -194,6 +232,7 @@ def train_lightgbm_model(
     name: str,
     lgb_config: LightGBMTrainConfig | None = None,
 ) -> tuple[LightGBMWrapper, dict]:
+    data_contract = prepared_data_contract(dataset)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     lgb_config = lgb_config or make_lightgbm_config(config)
@@ -266,7 +305,10 @@ def train_lightgbm_model(
             }
         )
 
-    wrapper = LightGBMWrapper(models, dataset.horizons, objective=lgb_config.objective)
+    wrapper = LightGBMWrapper(
+        models, dataset.horizons, objective=lgb_config.objective,
+        data_contract=data_contract, num_threads=params["num_threads"],
+    )
     val_pred, val_true, _ = predict_lightgbm_split(dataset, wrapper, "val")
     horizon_metrics = {}
     for i, horizon in enumerate(dataset.horizons):
@@ -284,8 +326,8 @@ def train_lightgbm_model(
 
     wrapper.save(out, name=name)
     (out / f"{name}_config.json").write_text(lgb_config.to_json() + "\n")
-    (out / f"{name}_details.json").write_text(json.dumps(lgb_details, indent=2) + "\n")
-    (out / f"{name}_history.json").write_text(json.dumps(history, indent=2) + "\n")
+    (out / f"{name}_details.json").write_text(json.dumps(lgb_details, indent=2, allow_nan=False) + "\n")
+    (out / f"{name}_history.json").write_text(json.dumps(history, indent=2, allow_nan=False) + "\n")
     return wrapper, {
         "history": history,
         "best_record": best_record,
@@ -300,6 +342,10 @@ def predict_lightgbm_split(
     split: str,
     chunk_times: int = 20_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if model.data_contract != prepared_data_contract(dataset):
+        raise ValueError("LightGBM dataset/model data contract mismatch; use the matching cache or retrain")
+    if chunk_times <= 0:
+        raise ValueError("chunk_times must be positive")
     start, end = _split_range(dataset, split)
     n_times = end - start
     pred = np.full((dataset.n_symbols, n_times, len(dataset.horizons)), np.nan, dtype="float32")

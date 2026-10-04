@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .provenance import CACHE_VERSION, raw_fingerprint, validate_cache_metadata
+
 
 BAR_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
 DEFAULT_FEATURE_WINDOWS = (5, 15, 30, 60, 240, 1440)
@@ -52,6 +54,7 @@ class PreparedDataset:
     bar_std: np.ndarray | None = None
     feature_mean: np.ndarray | None = None
     feature_std: np.ndarray | None = None
+    cache_metadata: dict | None = None
 
     @property
     def n_symbols(self) -> int:
@@ -80,50 +83,70 @@ def read_metadata(raw_dir: Path) -> dict:
 def _read_symbol_csv(path: Path) -> pd.DataFrame:
     with gzip.open(path, "rt", newline="") as f:
         df = pd.read_csv(f)
-    required = {"timestamp", "open", "high", "low", "close", "volume", "amount"}
+    required = {"timestamp", *BAR_COLUMNS}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"{path} missing columns: {sorted(missing)}")
-    df = df[["timestamp", "open", "high", "low", "close", "volume", "amount"]].copy()
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64")
+    if df.empty:
+        raise ValueError(f"{path} contains no bars")
+    df = df[["timestamp", *BAR_COLUMNS]].copy()
+    timestamps = pd.to_numeric(df["timestamp"], errors="coerce")
+    if (
+        not np.isfinite(timestamps).all()
+        or (timestamps % 60_000 != 0).any()
+        or (timestamps < np.iinfo(np.int64).min).any()
+        or (timestamps >= 2**63).any()
+    ):
+        raise ValueError(f"{path} has invalid timestamps; expected a one-minute grid in milliseconds")
+    df["timestamp"] = timestamps.astype("int64")
+    if df["timestamp"].duplicated().any():
+        raise ValueError(f"{path} has duplicate timestamps")
     for col in BAR_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["timestamp", *BAR_COLUMNS])
-    df["timestamp"] = df["timestamp"].astype("int64")
-    df = df.drop_duplicates("timestamp", keep="last").sort_values("timestamp")
-    return df
+    prices = df[["open", "high", "low", "close"]]
+    if (
+        not np.isfinite(df[BAR_COLUMNS].to_numpy()).all()
+        or (prices <= 0).any().any()
+        or (df[["volume", "amount"]] < 0).any().any()
+        or (df["high"] < prices.max(axis=1)).any()
+        or (df["low"] > prices.min(axis=1)).any()
+    ):
+        raise ValueError(f"{path} has invalid OHLCV values")
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
 def load_raw_bars(raw_dir: str | Path, min_coverage: float = 0.995) -> tuple[list[str], dict[str, pd.DataFrame]]:
+    # Keep min_coverage for configuration compatibility. Even a lower threshold
+    # cannot permit holes: every rolling window and label assumes 1 row = 1 min.
     raw = Path(raw_dir)
     csv_dir = raw / "csv"
     if not csv_dir.exists():
         raise FileNotFoundError(f"missing csv dir: {csv_dir}")
     metadata = read_metadata(raw)
-    symbols = metadata.get("symbols") or [p.stem.replace(".csv", "") for p in sorted(csv_dir.glob("*.csv.gz"))]
+    symbols = metadata.get("symbols", [p.stem.replace(".csv", "") for p in sorted(csv_dir.glob("*.csv.gz"))])
+    if not isinstance(symbols, list) or not symbols or any(not isinstance(sym, str) or not sym for sym in symbols):
+        raise ValueError(f"no valid symbol list found under {raw}")
+    if len(symbols) != len(set(symbols)):
+        raise ValueError("metadata contains duplicate symbols")
     frames: dict[str, pd.DataFrame] = {}
+    expected_timestamps: np.ndarray | None = None
     for symbol in symbols:
         path = csv_dir / f"{symbol}.csv.gz"
         if not path.exists():
-            continue
-        frames[symbol] = _read_symbol_csv(path)
-    if not frames:
-        raise ValueError(f"no symbol CSV files found under {csv_dir}")
-
-    timestamp_sets = [set(frame["timestamp"].to_numpy()) for frame in frames.values()]
-    common = sorted(set.intersection(*timestamp_sets))
-    if not common:
-        raise ValueError("symbols have no common timestamps")
-    common_index = pd.Index(common, name="timestamp")
-    aligned: dict[str, pd.DataFrame] = {}
-    for symbol, frame in frames.items():
-        reindexed = frame.set_index("timestamp").reindex(common_index)
-        coverage = 1.0 - float(reindexed[BAR_COLUMNS].isna().any(axis=1).mean())
-        if coverage < min_coverage:
-            raise ValueError(f"{symbol} coverage {coverage:.4f} below min_coverage={min_coverage}")
-        reindexed = reindexed.ffill().bfill()
-        aligned[symbol] = reindexed.reset_index()
-    return list(aligned.keys()), aligned
+            raise FileNotFoundError(f"missing symbol CSV: {path}")
+        frame = _read_symbol_csv(path)
+        timestamps = frame["timestamp"].to_numpy(dtype="int64")
+        if np.any(np.diff(timestamps) != 60_000):
+            raise ValueError(f"{symbol} has missing minutes in its one-minute grid")
+        for key, actual in (("start_ms", timestamps[0]), ("end_ms", timestamps[-1])):
+            if key in metadata and actual != metadata[key]:
+                raise ValueError(f"{symbol} {key}={actual} does not match metadata {key}={metadata[key]}")
+        if expected_timestamps is None:
+            expected_timestamps = timestamps
+        elif not np.array_equal(timestamps, expected_timestamps):
+            raise ValueError(f"{symbol} does not cover the same complete one-minute grid as {symbols[0]}")
+        frames[symbol] = frame
+    return symbols, frames
 
 
 def _rsi(close: pd.Series, window: int) -> pd.Series:
@@ -142,7 +165,7 @@ def _zscore(series: pd.Series, window: int) -> pd.Series:
 
 
 def _rolling_beta(asset_ret: pd.Series, benchmark_ret: pd.Series, window: int) -> pd.Series:
-    cov = asset_ret.rolling(window, min_periods=window).cov(benchmark_ret)
+    cov = asset_ret.rolling(window, min_periods=window).cov(benchmark_ret, ddof=0)
     var = benchmark_ret.rolling(window, min_periods=window).var(ddof=0)
     return (cov / var.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
@@ -278,7 +301,8 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
             exit_ = open_.shift(-(horizon + 1))
             labels.append(np.log(exit_ / entry.replace(0, np.nan)).to_numpy(dtype="float32"))
         labels_arr = np.stack(labels, axis=-1)
-        next_return = np.log(close.shift(-1) / close.replace(0, np.nan)).to_numpy(dtype="float32")
+        # A signal formed at t close enters at t+1 open and earns t+1 -> t+2.
+        next_return = np.log(open_.shift(-2) / open_.shift(-1).replace(0, np.nan)).to_numpy(dtype="float32")
         realized_horizon_blocks.append(labels_arr)
         label_blocks.append(labels_arr)
         next_return_blocks.append(next_return)
@@ -382,9 +406,17 @@ def prepare_dataset(config: DatasetConfig) -> PreparedDataset:
 
     train_end = valid_start + int((valid_end - valid_start) * 0.70)
     val_end = valid_start + int((valid_end - valid_start) * 0.85)
-    train_range = (valid_start, train_end)
-    val_range = (train_end, val_end)
+    # Labels enter at t+1 and exit at t+h+1. Remove boundary samples
+    # whose final price would come from the following evaluation partition.
+    purge = max_horizon + 1
+    train_range = (valid_start, train_end - purge)
+    val_range = (train_end, val_end - purge)
     test_range = (val_end, valid_end)
+    for split, (start, end) in {
+        "train": train_range, "val": val_range, "test": test_range
+    }.items():
+        if end <= start:
+            raise ValueError(f"empty {split} split after label purge; provide more data or shorter horizons")
 
     bar_inputs, bar_mean, bar_std = _standardize_train(bar_inputs, slice(*train_range))
     feature_inputs, feature_mean, feature_std = _standardize_train(feature_inputs, slice(*train_range))
@@ -436,6 +468,7 @@ def save_prepared_dataset(dataset: PreparedDataset, cache_dir: str | Path, confi
     if dataset.feature_std is not None:
         np.save(cache / "feature_std.npy", dataset.feature_std)
     metadata = {
+        "cache_version": CACHE_VERSION,
         "symbols": dataset.symbols,
         "feature_names": dataset.feature_names,
         "horizons": list(dataset.horizons),
@@ -452,6 +485,13 @@ def save_prepared_dataset(dataset: PreparedDataset, cache_dir: str | Path, confi
     }
     if config is not None:
         metadata["config"] = json.loads(config.to_json())
+        metadata["source_fingerprint"] = raw_fingerprint(config.raw_dir)
+    elif dataset.cache_metadata:
+        metadata["config"] = dataset.cache_metadata["config"]
+        metadata["source_fingerprint"] = dataset.cache_metadata["source_fingerprint"]
+    else:
+        raise ValueError("dataset source configuration required; use --rebuild-cache")
+    dataset.cache_metadata = metadata
     (cache / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -459,6 +499,7 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
     cache = Path(cache_dir)
     mode = "r" if mmap else None
     metadata = json.loads((cache / "metadata.json").read_text())
+    validate_cache_metadata(metadata)
     bar_mean = np.load(cache / "bar_mean.npy", mmap_mode=mode) if (cache / "bar_mean.npy").exists() else None
     bar_std = np.load(cache / "bar_std.npy", mmap_mode=mode) if (cache / "bar_std.npy").exists() else None
     feature_mean = (
@@ -467,7 +508,8 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
     feature_std = (
         np.load(cache / "feature_std.npy", mmap_mode=mode) if (cache / "feature_std.npy").exists() else None
     )
-    return PreparedDataset(
+    dataset = PreparedDataset(
+        cache_metadata=metadata,
         symbols=list(metadata["symbols"]),
         timestamps=np.load(cache / "timestamps.npy", mmap_mode=mode),
         bar_inputs=np.load(cache / "bar_inputs.npy", mmap_mode=mode),
@@ -486,6 +528,12 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
         feature_mean=feature_mean,
         feature_std=feature_std,
     )
+    arrays = {name: getattr(dataset, name) for name in (
+        "timestamps", "bar_inputs", "feature_inputs", "labels", "next_returns", "realized_horizon_returns",
+        "bar_mean", "bar_std", "feature_mean", "feature_std",
+    )}
+    validate_cache_metadata(metadata, arrays)
+    return dataset
 
 
 class WindowBatcher:

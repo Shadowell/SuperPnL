@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 
 from superpnl.data import DatasetConfig, load_prepared_dataset, prepare_dataset
+from superpnl.provenance import validate_cache, prepared_data_contract
+from superpnl.portfolio import simulate_weight_portfolio
 from superpnl.tabular_training import evaluate_lightgbm_model, make_lightgbm_config, train_lightgbm_model
 from superpnl.training import (
     LowTurnoverConfig,
@@ -28,39 +30,24 @@ from superpnl.training import (
 
 def ensure_dataset(args) -> object:
     cache_dir = Path(args.cache_dir)
-    if (cache_dir / "metadata.json").exists() and not args.rebuild_cache:
-        metadata = json.loads((cache_dir / "metadata.json").read_text())
-        cached_config = metadata.get("config", {})
-        requested = {
-            "lookback": args.lookback,
-            "horizons": [int(x) for x in args.horizons.split(",")],
-            "feature_windows": [int(x) for x in args.feature_windows.split(",")],
-            "factor_set": args.factor_set,
-        }
-        cached = {
-            "lookback": cached_config.get("lookback", metadata.get("lookback")),
-            "horizons": cached_config.get("horizons", metadata.get("horizons")),
-            "feature_windows": cached_config.get("feature_windows"),
-            "factor_set": cached_config.get("factor_set", "base"),
-        }
-        if cached != requested:
-            raise ValueError(
-                f"cache config mismatch for {cache_dir}: cached={cached}, requested={requested}. "
-                "Pass --rebuild-cache or use a matching --cache-dir."
-            )
-        return load_prepared_dataset(cache_dir, mmap=True)
     config = DatasetConfig(
         raw_dir=args.raw_dir,
         cache_dir=args.cache_dir,
         lookback=args.lookback,
         horizons=tuple(int(x) for x in args.horizons.split(",")),
         feature_windows=tuple(int(x) for x in args.feature_windows.split(",")),
-        factor_set=args.factor_set,
+        factor_set=getattr(args, "factor_set", "base"),
     )
+    if (cache_dir / "metadata.json").exists() and not args.rebuild_cache:
+        metadata = json.loads((cache_dir / "metadata.json").read_text())
+        validate_cache(json.loads(config.to_json()), metadata)
+        return load_prepared_dataset(cache_dir, mmap=True)
     return prepare_dataset(config)
 
 
-def format_metric(value: float | int) -> str:
+def format_metric(value: float | int | None) -> str:
+    if value is None:
+        return "N/A"
     if isinstance(value, int):
         return str(value)
     if abs(value) >= 10:
@@ -78,24 +65,33 @@ def split_datetime(dataset, split: str) -> tuple[str, str]:
     return ts[0].strftime("%Y-%m-%d %H:%M UTC"), ts[1].strftime("%Y-%m-%d %H:%M UTC")
 
 
-def by_symbol_summary(dataset, positions: np.ndarray, split: str) -> list[dict]:
+def by_symbol_summary(
+    dataset, positions: np.ndarray, split: str,
+    fixed_fee_bps: float = 0.0, fixed_slippage_bps: float = 0.0,
+    rebalance_interval_bars: int = 1,
+) -> list[dict]:
     start, end = {
         "train": dataset.train_range,
         "val": dataset.val_range,
         "test": dataset.test_range,
     }[split]
     next_returns = dataset.next_returns[:, start:end].astype("float64")
+    # Both backtest variants return actual portfolio weights.
+    ledger = simulate_weight_portfolio(
+        next_returns, positions,
+        cost_rate=(fixed_fee_bps + fixed_slippage_bps) / 10_000.0,
+        rebalance_mask=np.arange(end - start) % max(1, rebalance_interval_bars) == 0,
+    )
     out = []
     for i, symbol in enumerate(dataset.symbols):
-        log_sum = float(np.nansum(positions[i] * next_returns[i]))
         out.append(
             {
                 "symbol": symbol,
-                "total_return": float(np.exp(log_sum) - 1.0),
-                "avg_position": float(np.nanmean(positions[i])),
+                "pnl_contribution": float(ledger.pnl_by_symbol[i].sum()),
+                "avg_weight": float(ledger.positions[i].mean()) if positions.shape[1] else 0.0,
             }
         )
-    return sorted(out, key=lambda item: item["total_return"], reverse=True)
+    return sorted(out, key=lambda item: item["pnl_contribution"], reverse=True)
 
 
 def by_month_summary(dataset, portfolio_returns: np.ndarray, split: str) -> list[dict]:
@@ -104,7 +100,7 @@ def by_month_summary(dataset, portfolio_returns: np.ndarray, split: str) -> list
         "val": dataset.val_range,
         "test": dataset.test_range,
     }[split]
-    ts = pd.to_datetime(dataset.timestamps[start:end], unit="ms", utc=True)
+    ts = pd.to_datetime(dataset.timestamps[start + 2:end + 2], unit="ms", utc=True)
     frame = pd.DataFrame({"month": ts.strftime("%Y-%m"), "ret": portfolio_returns})
     rows = []
     for month, group in frame.groupby("month"):
@@ -205,7 +201,7 @@ def write_report(out_dir: Path, dataset, results: dict) -> None:
         report.append("")
         report.append("Top symbols:")
         for row in stability["by_symbol_top"][:10]:
-            report.append(f"- `{row['symbol']}` total_return={row['total_return']:.4f}, avg_pos={row['avg_position']:.4f}")
+            report.append(f"- `{row['symbol']}` pnl_contribution={row['pnl_contribution']:.4f}, avg_weight={row['avg_weight']:.4f}")
         report.append("")
         report.append("Monthly returns:")
         for row in stability["by_month"]:
@@ -365,7 +361,9 @@ def main() -> None:
             results["backtests"][key] = metrics
             if name == "full_feature_tcn":
                 results["stability"][key] = {
-                    "by_symbol_top": by_symbol_summary(dataset, positions, "test"),
+                    "by_symbol_top": by_symbol_summary(
+                        dataset, positions, "test", args.fixed_fee_bps, args.fixed_slippage_bps
+                    ),
                     "by_month": by_month_summary(dataset, portfolio_returns, "test"),
                 }
             if args.low_turnover_backtest:
@@ -384,10 +382,16 @@ def main() -> None:
                 results["backtests"][lt_key] = lt_metrics
                 if name == "full_feature_tcn":
                     results["stability"][lt_key] = {
-                        "by_symbol_top": by_symbol_summary(dataset, lt_positions, "test"),
+                        "by_symbol_top": by_symbol_summary(
+                            dataset, lt_positions, "test", args.fixed_fee_bps,
+                            args.fixed_slippage_bps, args.rebalance_interval_bars,
+                        ),
                         "by_month": by_month_summary(dataset, lt_portfolio_returns, "test"),
                     }
-        np.savez_compressed(out_dir / f"{name}_test_predictions.npz", pred=pred, true=true, pos_score=pos_score)
+        np.savez_compressed(
+            out_dir / f"{name}_test_predictions.npz", pred=pred, true=true, pos_score=pos_score,
+            data_contract=np.array(json.dumps(prepared_data_contract(dataset), sort_keys=True)),
+        )
 
     results["backtests"]["no_trade"] = {**no_trade_metrics(dataset, "test"), "horizon": "-"}
     results["backtests"]["buy_and_hold_equal_weight"] = {
@@ -413,7 +417,7 @@ def main() -> None:
         }
 
     results["elapsed_sec"] = time.time() - started
-    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2) + "\n")
+    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
     write_report(out_dir, dataset, results)
     print(f"wrote {out_dir / 'REPORT.md'}", flush=True)
 

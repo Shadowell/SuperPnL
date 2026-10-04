@@ -1,5 +1,7 @@
 # Long Horizon Experiment Report
 
+> **2026-10-05 评测修复后：** 本文数字是修复前历史记录。成交时点、组合记账、标签隔离和因子数值口径已修正，以下指标需重新训练和评测；本轮未重跑真实历史实验。
+
 本文档记录 `1h / 4h / 1d` horizon 的第一轮收益验证。结论先行：长周期的 rank IC 比 15m 更好，base factor model 明显强于 OHLCV-only；但经过 validation-only 低换手选参后，测试集 PnL 仍未跑赢 no-trade 或 buy-and-hold，暂不能视为可交易策略。
 
 ## 实验设置
