@@ -24,3 +24,17 @@ def test_checkpoint_records_the_exact_prepared_data_contract(tmp_path: Path, loa
     from superpnl.provenance import cache_data_contract
     assert checkpoint["data_contract"] == cache_data_contract(cache)
     assert checkpoint["data_contract"]["horizons"] == [5, 15]
+
+
+@pytest.mark.parametrize("corruption", ["horizon_order", "label_shape"])
+def test_training_rejects_inconsistent_prepared_dataset(tmp_path, corruption):
+    raw = tmp_path / "raw"
+    write_raw_frame(raw, make_raw_frame())
+    dataset = prepare_dataset(DatasetConfig(str(raw), str(tmp_path / "cache"), lookback=32))
+    if corruption == "horizon_order":
+        dataset.horizons = (15, 5)
+    else:
+        dataset.labels = dataset.labels[..., :1]
+    with pytest.raises(ValueError, match="data contract.*rebuild"):
+        train_model(dataset, False, TrainConfig(hidden_dim=4, epochs=0, device="cpu"), tmp_path / "run", "ohlcv_tcn")
+    assert not (tmp_path / "run" / "ohlcv_tcn.pt").exists()

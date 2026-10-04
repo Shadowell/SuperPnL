@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .provenance import CACHE_VERSION, raw_fingerprint
+from .provenance import CACHE_VERSION, raw_fingerprint, validate_cache_metadata
 
 
 BAR_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
@@ -404,9 +404,7 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
     cache = Path(cache_dir)
     mode = "r" if mmap else None
     metadata = json.loads((cache / "metadata.json").read_text())
-    if (metadata.get("cache_version") != CACHE_VERSION
-            or not metadata.get("source_fingerprint") or not metadata.get("config")):
-        raise ValueError("unsupported or incomplete cache; use --rebuild-cache")
+    validate_cache_metadata(metadata)
     bar_mean = np.load(cache / "bar_mean.npy", mmap_mode=mode) if (cache / "bar_mean.npy").exists() else None
     bar_std = np.load(cache / "bar_std.npy", mmap_mode=mode) if (cache / "bar_std.npy").exists() else None
     feature_mean = (
@@ -415,7 +413,7 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
     feature_std = (
         np.load(cache / "feature_std.npy", mmap_mode=mode) if (cache / "feature_std.npy").exists() else None
     )
-    return PreparedDataset(
+    dataset = PreparedDataset(
         cache_metadata=metadata,
         symbols=list(metadata["symbols"]),
         timestamps=np.load(cache / "timestamps.npy", mmap_mode=mode),
@@ -435,6 +433,12 @@ def load_prepared_dataset(cache_dir: str | Path, mmap: bool = True) -> PreparedD
         feature_mean=feature_mean,
         feature_std=feature_std,
     )
+    arrays = {name: getattr(dataset, name) for name in (
+        "timestamps", "bar_inputs", "feature_inputs", "labels", "next_returns", "realized_horizon_returns",
+        "bar_mean", "bar_std", "feature_mean", "feature_std",
+    )}
+    validate_cache_metadata(metadata, arrays)
+    return dataset
 
 
 class WindowBatcher:

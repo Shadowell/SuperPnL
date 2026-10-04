@@ -39,9 +39,8 @@ def raw_fingerprint(raw_dir: str | Path) -> dict[str, str]:
 
 
 def validate_cache(config: dict, metadata: dict) -> None:
+    validate_cache_metadata(metadata)
     instruction = "use --rebuild-cache to rebuild the prepared dataset"
-    if metadata.get("cache_version") != CACHE_VERSION:
-        raise ValueError(f"unsupported or legacy cache version; {instruction}")
     if not metadata.get("config") or config_identity(metadata["config"]) != config_identity(config):
         raise ValueError(f"cache configuration mismatch; {instruction}")
     if metadata.get("source_fingerprint") != raw_fingerprint(config["raw_dir"]):
@@ -55,15 +54,71 @@ CONTRACT_FIELDS = (
 STATS_NAMES = ("bar_mean", "bar_std", "feature_mean", "feature_std")
 
 
+def validate_cache_metadata(metadata: dict, arrays: dict | None = None) -> None:
+    """Reject contradictory schemas and shapes before cache data reaches training."""
+    def invalid(reason: str) -> None:
+        raise ValueError(f"Invalid data contract: {reason}; use --rebuild-cache and retrain")
+
+    if metadata.get("cache_version") != CACHE_VERSION or not metadata.get("source_fingerprint"):
+        invalid("missing cache version or source fingerprint")
+    if any(key not in metadata for key in (*CONTRACT_FIELDS, "config")):
+        invalid("incomplete cache metadata")
+    config = metadata["config"]
+    if not isinstance(config, dict):
+        invalid("missing preparation configuration")
+    for key in ("lookback", "n_times", "n_symbols", "bar_dim", "feature_dim"):
+        value = metadata[key]
+        minimum = 0 if key == "feature_dim" else 1
+        if type(value) is not int or value < minimum:
+            invalid(f"invalid {key}")
+    horizons = metadata["horizons"]
+    if (not isinstance(horizons, (list, tuple)) or not horizons
+            or any(type(value) is not int or value <= 0 for value in horizons)
+            or len(set(horizons)) != len(horizons)):
+        invalid("horizons must be distinct positive integers")
+    if list(horizons) != config.get("horizons") or metadata["lookback"] != config.get("lookback"):
+        invalid("horizons/lookback disagree with preparation configuration")
+    for key, dimension in (("symbols", "n_symbols"), ("feature_names", "feature_dim")):
+        names = metadata[key]
+        if (not isinstance(names, (list, tuple)) or len(names) != metadata[dimension]
+                or any(not isinstance(name, str) or not name for name in names)
+                or len(set(names)) != len(names)):
+            invalid(f"{key} must contain {metadata[dimension]} distinct names")
+    max_horizon = max(horizons)
+    previous_end = None
+    for key in ("train_range", "val_range", "test_range"):
+        bounds = metadata[key]
+        if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+                or any(type(value) is not int for value in bounds)):
+            invalid(f"invalid {key}")
+        start, end = bounds
+        if not metadata["lookback"] - 1 <= start < end or end + max_horizon >= metadata["n_times"]:
+            invalid(f"{key} is empty or lacks lookback/label history")
+        if previous_end is not None and previous_end + max_horizon >= start:
+            invalid(f"{key} overlaps the preceding partition or its labels")
+        previous_end = end
+    if arrays is not None:
+        n_symbols, n_times = metadata["n_symbols"], metadata["n_times"]
+        expected = {
+            "timestamps": (n_times,),
+            "bar_inputs": (n_symbols, n_times, metadata["bar_dim"]),
+            "feature_inputs": (n_symbols, n_times, metadata["feature_dim"]),
+            "labels": (n_symbols, n_times, len(horizons)),
+            "next_returns": (n_symbols, n_times),
+            "realized_horizon_returns": (n_symbols, n_times, len(horizons)),
+            **{name: (metadata["bar_dim"] if name.startswith("bar_") else metadata["feature_dim"],)
+               for name in STATS_NAMES},
+        }
+        for name, shape in expected.items():
+            if getattr(arrays.get(name), "shape", None) != shape:
+                invalid(f"{name} array shape must be {shape}")
+
+
 def build_data_contract(metadata: dict, stats: dict) -> dict:
     """Bind semantic schema and normalization to a versioned data source."""
     import numpy as np
 
-    if metadata.get("cache_version") != CACHE_VERSION or not metadata.get("source_fingerprint"):
-        raise ValueError("Missing versioned data contract; rebuild cache and retrain the model")
-    required = (*CONTRACT_FIELDS, "config")
-    if any(key not in metadata for key in required):
-        raise ValueError("Incomplete data contract; rebuild cache and retrain the model")
+    validate_cache_metadata(metadata)
     config = {key: value for key, value in metadata["config"].items()
               if key not in {"cache_dir", "raw_dir"}}
     hashes = {}
@@ -104,4 +159,8 @@ def prepared_data_contract(dataset) -> dict:
     metadata = dict(dataset.cache_metadata)
     metadata.update({key: getattr(dataset, key) for key in CONTRACT_FIELDS})
     stats = {name: getattr(dataset, name) for name in STATS_NAMES}
+    arrays = {name: getattr(dataset, name) for name in (
+        "timestamps", "bar_inputs", "feature_inputs", "labels", "next_returns", "realized_horizon_returns",
+    )}
+    validate_cache_metadata(metadata, {**arrays, **stats})
     return build_data_contract(metadata, stats)
