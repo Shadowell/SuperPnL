@@ -16,7 +16,7 @@
 
 ## Phase 3: US3 模型交付
 - [x] T009 [P] [US3] 修复 #9 scripts/package_superpnl_model.py 从实际 checkpoint 取架构，tests/test_package.py。
-- [ ] T010 [US3] 修复 #10 scripts/package_superpnl_model.py 失败安全替换，测试旧包保留。
+- [x] T010 [US3] 修复 #10 scripts/package_superpnl_model.py 失败安全替换，测试旧包保留。
 - [ ] T011 [US3] 修复 #5 data.py/training.py/package_superpnl_model.py 数据契约及不匹配拒绝测试。
 
 ## Phase 4: Completion
