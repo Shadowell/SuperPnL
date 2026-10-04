@@ -57,8 +57,9 @@ def compute_pnl_metrics(portfolio_returns: np.ndarray, positions: np.ndarray) ->
         sharpe = 0.0
         sortino = 0.0
         annualized_return = total_return
-    peak = np.maximum.accumulate(equity) if len(equity) else np.array([1.0])
-    drawdown = equity / peak - 1.0 if len(equity) else np.array([0.0])
+    equity_with_initial = np.concatenate(([1.0], equity))
+    peak = np.maximum.accumulate(equity_with_initial)
+    drawdown = equity_with_initial / peak - 1.0
     max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
     calmar = float(annualized_return / abs(max_drawdown)) if abs(max_drawdown) > 1e-12 else 0.0
     wins = returns[returns > 0]
@@ -66,7 +67,7 @@ def compute_pnl_metrics(portfolio_returns: np.ndarray, positions: np.ndarray) ->
     win_rate = float((returns > 0).mean()) if len(returns) else 0.0
     profit_factor = float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else 0.0
     pos = np.nan_to_num(positions.astype("float64"), nan=0.0)
-    turnover = float(np.abs(np.diff(pos, axis=1, prepend=0.0)).mean()) if pos.ndim == 2 else 0.0
+    turnover = float(np.abs(np.diff(pos, axis=1, prepend=0.0)).mean()) if pos.ndim == 2 and pos.size else 0.0
     average_position = float(pos.mean()) if pos.size else 0.0
     trade_count = int((np.abs(np.diff(pos, axis=1, prepend=0.0)) > 1e-6).sum()) if pos.ndim == 2 else 0
     holding = _average_holding_minutes(pos)
