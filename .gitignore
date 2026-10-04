@@ -16,3 +16,9 @@ outputs/
 *.pth
 *.safetensors
 .env
+
+*.npy
+*.npz
+*.egg-info/
+build/
+dist/
