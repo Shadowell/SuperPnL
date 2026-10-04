@@ -14,6 +14,7 @@ from .data import PreparedDataset, WindowBatcher
 from .metrics import compute_pnl_metrics, rank_ic_by_time, regression_metrics
 from .model import SuperPnLModel
 from .portfolio import PortfolioLedger, simulate_portfolio
+from .provenance import prepared_data_contract
 
 
 @dataclass
@@ -52,6 +53,7 @@ def train_model(
     out_dir: str | Path,
     name: str,
 ) -> tuple[SuperPnLModel, dict]:
+    data_contract = prepared_data_contract(dataset)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     out = Path(out_dir)
@@ -115,7 +117,8 @@ def train_model(
         history.append(record)
         print(f"{name} epoch {epoch}: {record}", flush=True)
     model_path = out / f"{name}.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(config), "use_features": use_features}, model_path)
+    torch.save({"model": model.state_dict(), "config": asdict(config), "use_features": use_features,
+                "data_contract": data_contract}, model_path)
     (out / f"{name}_history.json").write_text(json.dumps(history, indent=2) + "\n")
     return model, {"history": history, "model_path": str(model_path)}
 

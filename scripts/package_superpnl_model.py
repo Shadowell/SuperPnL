@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from superpnl.model import SuperPnLModel
+from superpnl.provenance import cache_data_contract
 
 
 BAR_FEATURE_NAMES = [
@@ -197,6 +198,11 @@ def build_package(args: argparse.Namespace, package_dir: Path) -> None:
 
     model_src = run_dir / f"{args.model_name}.pt"
     checkpoint = torch.load(model_src, map_location="cpu", weights_only=True)
+    training_data_contract = checkpoint.get("data_contract")
+    if not training_data_contract:
+        raise ValueError("Checkpoint has no data contract; rebuild the dataset cache and retrain")
+    if training_data_contract != cache_data_contract(cache_dir):
+        raise ValueError("Checkpoint/cache data contract mismatch; use the matching cache or retrain")
     state = checkpoint["model"]
     use_features = checkpoint["use_features"]
     architecture = {
@@ -273,6 +279,7 @@ def build_package(args: argparse.Namespace, package_dir: Path) -> None:
     }
 
     data_contract = {
+        "training_data_contract": training_data_contract,
         "decision_time": "At confirmed 1m bar t, generate features from bars <= t.",
         "entry_exit_label_used_in_training": "label_h = log(open_{t+h+1} / open_{t+1})",
         "live_prediction_output": {
