@@ -20,7 +20,7 @@
 - [ ] T011 [US3] 修复 #5 data.py/training.py/package_superpnl_model.py 数据契约及不匹配拒绝测试。
 
 ## Phase 4: Completion
-- [ ] T012 修复 #11 pyproject.toml matplotlib 依赖，验证绘图 CLI。
+- [x] T012 修复 #11 pyproject.toml matplotlib 依赖，验证绘图 CLI。
 - [ ] T013 同步 README.md 和 docs/ 口径，标记历史结果需重算；添加并运行 CPU CLI 集成测试。
 - [ ] T014 全量测试、独立审查、converge 与 git diff --check；确保每 issue 独立 commit。
 
