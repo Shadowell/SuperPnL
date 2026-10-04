@@ -189,8 +189,12 @@ def backtest_scores(
         "test": dataset.test_range,
     }[split]
     threshold = threshold_bps / 10_000.0
+    if not np.isfinite(threshold):
+        raise ValueError("backtest threshold_bps must be finite")
     cost = (fixed_fee_bps + fixed_slippage_bps) / 10_000.0
     scores = pred[:, :, horizon_index]
+    if not np.isfinite(scores).all():
+        raise ValueError("backtest scores must all be finite; predict the full split before backtesting")
     signals = (scores > threshold).astype("float64")
     next_returns = dataset.next_returns[:, start:end].astype("float64")
     ledger = simulate_portfolio(next_returns, signals, cost_rate=cost)

@@ -148,3 +148,21 @@ def test_momentum_rejects_schema_without_return_features():
 
     with pytest.raises(ValueError, match="return feature"):
         backtest_rule_momentum(dataset, "test", 0)
+
+
+@pytest.mark.parametrize("invalid_score", [np.nan, np.inf, -np.inf])
+def test_backtest_rejects_nonfinite_scores_before_creating_positions(invalid_score):
+    dataset = make_dataset([[1.0, 1.0], [1.0, 1.0]])
+    pred = np.ones((2, 2, 1))
+    pred[1, 0, 0] = invalid_score
+
+    with pytest.raises(ValueError, match="scores.*finite"):
+        backtest_scores(dataset, pred, "test", 0)
+
+
+@pytest.mark.parametrize("threshold_bps", [np.nan, np.inf, -np.inf])
+def test_backtest_rejects_nonfinite_thresholds(threshold_bps):
+    dataset = make_dataset([[1.0]])
+
+    with pytest.raises(ValueError, match="threshold.*finite"):
+        backtest_scores(dataset, np.ones((1, 1, 1)), "test", 0, threshold_bps=threshold_bps)
