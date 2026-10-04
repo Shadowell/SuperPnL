@@ -34,3 +34,4 @@ T011 依赖 T008、T007、T010；T012 可独立；T013/T014 最后。
 - [x] T016 修复 #13 training.py非有限预测和阈值拒绝，tests/test_backtest.py。
 - [ ] T017 修正 #1/#2 分月结束时间与分币净贡献归因，scripts/run_superpnl_experiment.py、tests/test_reporting.py。
 - [x] T018 修复 #5/#8 缓存顶层schema/config矛盾及数组形状检查，provenance.py/data.py回归105项通过。
+- [x] T019 修复 #12 常量float32截面相关系数NaN，metrics.py/test_metrics.py回归通过。

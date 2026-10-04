@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 import pytest
 
-from superpnl.metrics import compute_pnl_metrics
+from superpnl.metrics import compute_pnl_metrics, rank_ic_by_time
 
 
 @pytest.mark.parametrize(
@@ -58,3 +58,30 @@ def test_single_downside_observation_does_not_emit_runtime_warning():
 
     assert metrics.sortino == 0.0
     assert metrics.annualized_return is not None
+
+
+@pytest.mark.parametrize("constant_side", ["pred", "true", "both"])
+def test_constant_float32_cross_sections_have_finite_zero_ic(constant_side):
+    constant = np.full((3, 2), 3e-5, dtype="float32")
+    varied = np.array([[0.01, 0.03], [0.02, 0.02], [0.03, 0.01]], dtype="float32")
+    pred = constant if constant_side in ("pred", "both") else varied
+    true = constant if constant_side in ("true", "both") else varied
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        metrics = rank_ic_by_time(pred, true)
+
+    assert metrics == {"ic": 0.0, "icir": 0.0, "rank_ic": 0.0, "rank_icir": 0.0}
+    json.dumps(metrics, allow_nan=False)
+
+
+def test_ic_ignores_constant_times_without_losing_valid_cross_sections():
+    pred = np.array([[3e-5, 0.01], [3e-5, 0.02], [3e-5, 0.03]], dtype="float32")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        metrics = rank_ic_by_time(pred, pred.copy())
+
+    assert metrics["ic"] == pytest.approx(1.0)
+    assert metrics["rank_ic"] == pytest.approx(1.0)
+    assert metrics["icir"] == 0.0
+    assert metrics["rank_icir"] == 0.0
+    json.dumps(metrics, allow_nan=False)

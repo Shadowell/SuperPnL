@@ -124,14 +124,20 @@ def rank_ic_by_time(pred: np.ndarray, true: np.ndarray) -> dict[str, float]:
         mask = np.isfinite(p) & np.isfinite(y)
         if mask.sum() < 3:
             continue
-        p = p[mask]
-        y = y[mask]
+        # Use the same precision for the variance gate and corrcoef. A
+        # constant float32 vector can have nonzero std from mean rounding.
+        p = p[mask].astype("float64")
+        y = y[mask].astype("float64")
         if np.std(p) > 1e-12 and np.std(y) > 1e-12:
-            ics.append(float(np.corrcoef(p, y)[0, 1]))
+            correlation = float(np.corrcoef(p, y)[0, 1])
+            if np.isfinite(correlation):
+                ics.append(correlation)
         rank = pd.Series(p).rank().to_numpy()
         yrank = pd.Series(y).rank().to_numpy()
         if np.std(rank) > 1e-12 and np.std(yrank) > 1e-12:
-            rank_ics.append(float(np.corrcoef(rank, yrank)[0, 1]))
+            correlation = float(np.corrcoef(rank, yrank)[0, 1])
+            if np.isfinite(correlation):
+                rank_ics.append(correlation)
     def summarize(values: list[float]) -> tuple[float, float]:
         if not values:
             return 0.0, 0.0
