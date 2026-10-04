@@ -24,10 +24,12 @@ def test_small_cpu_experiment_packages_both_models(tmp_path):
         write_raw_frame(raw, frame, symbol)
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"),
            "PYTHONDONTWRITEBYTECODE": "1", "OMP_NUM_THREADS": "1",
-           "MKL_NUM_THREADS": "1"}
+           "MKL_NUM_THREADS": "1", "LGB_NUM_THREADS": "1"}
     command = [sys.executable, "-B", "scripts/run_superpnl_experiment.py",
                "--raw-dir", str(raw), "--cache-dir", str(cache), "--out-dir", str(run),
-               "--lookback", "32", "--epochs", "1", "--samples-per-epoch", "8",
+               "--lookback", "32", "--horizons", "5,15", "--feature-windows", "5,15,30",
+               "--lightgbm-num-boost-round", "2", "--lightgbm-early-stopping-rounds", "1",
+               "--low-turnover-backtest", "--epochs", "1", "--samples-per-epoch", "8",
                "--batch-size", "4", "--hidden-dim", "4", "--validation-samples", "12",
                "--device", "cpu", "--fixed-fee-bps", "10", "--fixed-slippage-bps", "2"]
     completed = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)

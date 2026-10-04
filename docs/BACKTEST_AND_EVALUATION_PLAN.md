@@ -23,7 +23,7 @@ average_position 是组合总风险敞口。分币净贡献合计等于组合净
 在明确的固定成本或零成本假设下，SuperPnL 是否能比 no-trade、buy-and-hold 和 OHLCV-only 模型产生更稳定的现货 PnL？
 ```
 
-不要一开始追求复杂模型。先用严格的时间切分验证信号是否有交易价值。当前阶段不引入盘口、成本、流动性训练特征。
+不要一开始追求复杂模型。先用严格的时间切分验证信号是否有交易价值。当前阶段不引入盘口或订单簿特征；流动性先作为历史 OHLCV 派生因子和交易过滤器使用。
 
 ---
 
@@ -46,6 +46,16 @@ Top20
 - Top100 长尾币缺失和噪声更多。
 - Top20 是训练速度、流动性和截面数量的折中。
 - 币池必须过滤 1min 历史长度不足的刚上市币，建议最低 `>= 180 days`，正式训练优先 `>= 365 days`。
+
+下一轮优化可以补充：
+
+```text
+Top50 / Top100
+factor_set = expanded
+feature_windows = 5,15,30,60,240,1440
+```
+
+Top100 更适合验证因子泛化，不应直接理解为可交易 universe。若 Top100 训练后只交易 Top20/Top50 高流动性标的，报告必须分别标注训练 universe 和交易 universe。
 
 ### 2.2 暂不做永续
 
@@ -122,6 +132,19 @@ cooldown_minutes = 5
 
 所有实验必须使用同一套交易约束，否则 PnL 不可比。
 
+下一轮低换手回测默认约束：
+
+```text
+top_k = 3
+rebalance_interval_bars = 15
+min_holding_bars = 30
+cooldown_bars = 30
+max_position_per_symbol = 0.20
+max_total_position = 0.60
+```
+
+这些参数只能在 validation split 上选择。禁止用 test 结果反复搜索。
+
 ---
 
 ## 4. 实验组
@@ -136,6 +159,8 @@ cooldown_minutes = 5
 | `ohlcv_tcn_trader` | 只用 OHLCV | 判断纯价格序列交易价值 |
 | `technical_tcn_trader` | OHLCV + 技术特征 | 判断 OHLCV 派生特征是否改善交易 |
 | `full_feature_tcn_trader` | OHLCV + 技术 + 市场 + 时间特征 | 判断完整 schema 增益 |
+| `expanded_factor_tcn_trader` | OHLCV + 多周期趋势 + 流动性 + 波动/跳变 + 残差强弱 | 判断市面上更常见的趋势/流动性/状态因子是否改善含成本 PnL |
+| `lightgbm_trader` | 所有 expanded 的横截面因子 | 验证基于树模型的低换手、高抗噪预测架构是否能在加入真实成本后保留净 PnL |
 
 ### 4.2 固定成本敏感性实验
 
@@ -190,6 +215,9 @@ average_position
 average_holding_minutes
 fixed_fee_bps
 fixed_slippage_bps
+gross_total_return
+net_total_return
+cost_return
 ```
 
 如果使用零成本回测，必须在结果表中明确显示 `fixed_fee_bps = 0` 和 `fixed_slippage_bps = 0`。
@@ -203,6 +231,8 @@ by_symbol_pnl
 by_month_pnl
 by_horizon_pnl
 by_market_regime_pnl
+by_liquidity_bucket_pnl
+by_volatility_bucket_pnl
 ```
 
 认为模型有效，不能只靠单个币种、单个月份或单个行情段。
@@ -327,7 +357,18 @@ OHLCV + technical + market + time
 
 这是第一版主实验。
 
-### Step 5: Walk-forward 和固定成本敏感性
+### Step 5: Expanded 因子与 LightGBM
+
+```text
+factor_set=expanded
+多周期 trend/reversal/liquidity/volatility/residual 因子
+使用 lightgbm_trader 作为核心 Baseline
+top-k + min_holding + cooldown + max_total_position
+```
+
+在提取出丰富的横截面排序因子后，使用 LightGBM 模型替代 TCN 的位置分配逻辑，验证低换手下的净 PnL。先在 validation split 上搜索低换手参数，再对 test split 只报告一次。新增因子均来自历史 OHLCV 和同一时刻截面数据，不直接引入未来信息；主要泄漏风险是用未来成交额或未来上市状态选择 universe。
+
+### Step 6: Walk-forward 和固定成本敏感性
 
 只有单次 test 通过后，才做 walk-forward。固定成本敏感性可以从 zero_cost、small_maker、small_taker 三档开始。
 
@@ -342,6 +383,7 @@ OHLCV + technical + market + time
 | 回测引擎 smoke | Top5, 30 天 | 数分钟 |
 | OHLCV-only trader | Top20, 6 个月 | 0.5 到 2 小时 |
 | full feature trader | Top20, 6 个月 | 1 到 3 小时 |
+| expanded factor trader | Top20/Top50, 12 个月 | 显著高于 base，取决于 feature_windows |
 | walk-forward | Top20, 12 个月 | 视窗口数量线性增加 |
 
 实际耗时取决于 batch size、`strategy_horizons`、模型宽度、数据 IO 和回测事件粒度。

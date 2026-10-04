@@ -33,3 +33,8 @@ def test_monthly_attribution_uses_return_end_instead_of_decision_time():
                            train_range=(0, 1), val_range=(0, 1), test_range=(0, 1))
     rows = by_month_summary(data, np.array([0.01]), "test")
     assert rows[0]["month"] == "2026-02"
+
+
+def test_symbol_attribution_supports_concentrated_direct_weights():
+    rows = by_symbol_summary(sample_dataset(), np.array([[0.8], [0.0]]), "test")
+    assert sum(row["pnl_contribution"] for row in rows) == pytest.approx(0.8)

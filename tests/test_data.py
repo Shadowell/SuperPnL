@@ -43,7 +43,7 @@ def test_next_returns_begin_at_next_open_after_decision(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     write_raw_frame(raw_dir, frame)
     dataset = prepare_dataset(
-        DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, horizons=(1, 5))
+        DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, feature_windows=(5, 15, 30), horizons=(1, 5))
     )
 
     assert dataset.next_returns[0, decision] == pytest.approx(0.0)
@@ -62,7 +62,7 @@ def test_future_split_prices_do_not_change_earlier_samples(
     raw_dir = tmp_path / "raw"
     frame = make_raw_frame()
     write_raw_frame(raw_dir, frame)
-    config = DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, horizons=(5, 15))
+    config = DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, feature_windows=(5, 15, 30), horizons=(5, 15))
     before = prepare_dataset(config)
     later_start, _ = getattr(before, later_split)
     frame.loc[later_start:, ["open", "high", "low", "close"]] *= 2
@@ -86,7 +86,7 @@ def test_future_split_prices_do_not_change_earlier_samples(
 def test_dataset_rejects_empty_split_after_label_purge(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     write_raw_frame(raw_dir, make_raw_frame(n=100))
-    config = DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, horizons=(5, 15))
+    config = DatasetConfig(str(raw_dir), str(tmp_path / "cache"), lookback=32, feature_windows=(5, 15, 30), horizons=(5, 15))
 
     with pytest.raises(ValueError, match="empty.*split.*purge"):
         prepare_dataset(config)

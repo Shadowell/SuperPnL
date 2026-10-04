@@ -8,6 +8,7 @@ dependencies = [
   "pandas",
   "torch",
   "matplotlib",
+  "lightgbm",
 ]
 
 [build-system]

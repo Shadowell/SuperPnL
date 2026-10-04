@@ -16,7 +16,7 @@ def cached_args(tmp_path):
     raw = tmp_path / "raw"
     write_raw_frame(raw, make_raw_frame())
     cache = tmp_path / "cache"
-    prepare_dataset(DatasetConfig(str(raw), str(cache), lookback=32))
+    prepare_dataset(DatasetConfig(str(raw), str(cache), lookback=32, horizons=(5, 15), feature_windows=(5, 15, 30)))
     return Namespace(raw_dir=str(raw), cache_dir=str(cache), lookback=32,
                      horizons="5,15", feature_windows="5,15,30", rebuild_cache=False)
 

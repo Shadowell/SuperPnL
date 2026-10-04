@@ -35,3 +35,8 @@ T011 依赖 T008、T007、T010；T012 可独立；T013/T014 最后。
 - [x] T017 修正 #1/#2 分月结束时间与分币净贡献归因，scripts/run_superpnl_experiment.py、tests/test_reporting.py。
 - [x] T018 修复 #5/#8 缓存顶层schema/config矛盾及数组形状检查，provenance.py/data.py回归105项通过。
 - [x] T019 修复 #12 常量float32截面相关系数NaN，metrics.py/test_metrics.py回归通过。
+
+
+## Phase 6: Integrate remote main before merge
+- [x] T020 整合远端 b42854b 的 expanded/LightGBM/低换手功能，保留 #1–#13 修复；补小型回归。
+- [x] T021 检查新入口的数据契约与费用归因，复跑全部测试，形成可推送合入的提交。

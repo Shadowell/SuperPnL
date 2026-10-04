@@ -40,22 +40,44 @@ def simulate_portfolio(
     cost_rate: float = 0.0,
     rebalance: bool = True,
 ) -> PortfolioLedger:
-    """Simulate long-only signals/N using self-financed trades and cash.
+    """Simulate long-only signals/N; keep the original equal-sleeve API."""
+    signals = np.asarray(signals, dtype="float64")
+    if signals.ndim != 2 or signals.shape[0] == 0:
+        raise ValueError("signals must have a [symbols, time] shape")
+    if not np.isfinite(signals).all() or np.any((signals < 0.0) | (signals > 1.0)):
+        raise ValueError("signals must be finite and in [0, 1]")
+    mask = np.ones(signals.shape[1], dtype=bool)
+    if not rebalance:
+        mask[1:] = False
+    return simulate_weight_portfolio(log_returns, signals / signals.shape[0], cost_rate, mask)
+
+
+def simulate_weight_portfolio(
+    log_returns: np.ndarray,
+    target_weights: np.ndarray,
+    cost_rate: float = 0.0,
+    rebalance_mask: np.ndarray | None = None,
+) -> PortfolioLedger:
+    """Simulate actual portfolio target weights using self-financed trades.
 
     Inputs have shape [symbols, time]. Trades occur before each supplied
     asset return. Positions are actual post-trade portfolio weights; costs,
     traded notional and PnL contributions are amounts per initial capital 1.
-    With rebalance=False only the first signal is traded. Final holdings are
-    marked to market without charging a hypothetical liquidation fee.
+    Only rebalance_mask=True bars trade; holdings drift between those bars.
+    Final holdings are marked to market without a liquidation fee.
     """
     returns = np.asarray(log_returns, dtype="float64")
-    signals = np.asarray(signals, dtype="float64")
-    if returns.ndim != 2 or signals.shape != returns.shape or returns.shape[0] == 0:
-        raise ValueError("log_returns and signals must have matching [symbols, time] shapes")
+    target_weights = np.asarray(target_weights, dtype="float64")
+    if returns.ndim != 2 or target_weights.shape != returns.shape or returns.shape[0] == 0:
+        raise ValueError("log_returns and target_weights must have matching [symbols, time] shapes")
     if not np.isfinite(returns).all():
         raise ValueError("log_returns must be finite")
-    if not np.isfinite(signals).all() or np.any((signals < 0.0) | (signals > 1.0)):
-        raise ValueError("signals must be finite and in [0, 1]")
+    if (not np.isfinite(target_weights).all() or np.any(target_weights < 0.0)
+            or np.any(target_weights.sum(axis=0) > 1.0 + 1e-12)):
+        raise ValueError("target_weights must be finite, nonnegative and sum to at most 1")
+    mask = np.ones(returns.shape[1], dtype=bool) if rebalance_mask is None else np.asarray(rebalance_mask)
+    if mask.shape != (returns.shape[1],) or mask.dtype != np.dtype(bool):
+        raise ValueError("rebalance_mask must be a boolean vector with one value per time step")
     if not np.isfinite(cost_rate) or not 0.0 <= cost_rate < 1.0:
         raise ValueError("cost_rate must be finite and in [0, 1)")
     simple_returns = np.expm1(returns)
@@ -74,8 +96,8 @@ def simulate_portfolio(
     cash = 1.0
     equity = 1.0
     for t in range(n_times):
-        if rebalance or t == 0:
-            weights = signals[:, t] / n_symbols
+        if mask[t]:
+            weights = target_weights[:, t]
             post_cost_equity = _post_cost_equity(equity, holdings, weights, cost_rate)
             target_holdings = weights * post_cost_equity
             traded_notional[:, t] = np.abs(target_holdings - holdings)

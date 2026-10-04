@@ -13,7 +13,7 @@ def test_checkpoint_records_the_exact_prepared_data_contract(tmp_path: Path, loa
     raw = tmp_path / "raw"
     cache = tmp_path / "cache"
     write_raw_frame(raw, make_raw_frame())
-    dataset = prepare_dataset(DatasetConfig(str(raw), str(cache), lookback=32))
+    dataset = prepare_dataset(DatasetConfig(str(raw), str(cache), lookback=32, horizons=(5, 15), feature_windows=(5, 15, 30)))
     if loaded:
         dataset = load_prepared_dataset(cache)
     run = tmp_path / "run"
@@ -30,7 +30,7 @@ def test_checkpoint_records_the_exact_prepared_data_contract(tmp_path: Path, loa
 def test_training_rejects_inconsistent_prepared_dataset(tmp_path, corruption):
     raw = tmp_path / "raw"
     write_raw_frame(raw, make_raw_frame())
-    dataset = prepare_dataset(DatasetConfig(str(raw), str(tmp_path / "cache"), lookback=32))
+    dataset = prepare_dataset(DatasetConfig(str(raw), str(tmp_path / "cache"), lookback=32, horizons=(5, 15), feature_windows=(5, 15, 30)))
     if corruption == "horizon_order":
         dataset.horizons = (15, 5)
     else:

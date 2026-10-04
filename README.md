@@ -52,11 +52,10 @@ threshold_bps = 0
 
 历史观察（待修复后的评测重新验证）：
 
-- `15m` 是唯一值得继续研究的 horizon。
-- `5m` 噪声太高，当前因子和模型没有转化成 PnL。
-- `30m` 零成本下仍为负，虽然换手更低，但暂不适合作为主策略。
-- 有因子模型在 `15m` 明显优于 OHLCV-only，说明历史因子对 15m PnL 有增量价值。
-- 15m 的收益集中在高波动小币，尤其 ZKJ、BIO、APE、PI、PEPE，样本外稳定性仍需要继续验证。
+- 深度学习 TCN 模型的换手率较高，受交易成本影响严重。目前已加入 **LightGBM (tabular 模型)** 作为互补路线，旨在利用树模型的阶梯输出特性大幅压制高频换手，同时更好地拟合截面因子 (Cross-Sectional Features) 来提升 PnL 稳定性。
+- `15m` 仍然是具有参考价值的核心 horizon。同时，系统已扩展支持更长的周期 `60m (1h)`, `240m (4h)`, `1440m (1d)` 以满足低换手策略的研究需求。
+- 有因子模型在截面收益排序能力上优于 OHLCV-only，说明历史因子 (尤其是 `expanded` 因子) 对 PnL 有增量价值。
+- 15m 的收益集中在高波动小币，样本外稳定性仍需通过增加历史数据长度 (如使用 LightGBM) 继续验证。
 
 ## 项目定位
 
@@ -67,9 +66,8 @@ OKX 1min OHLCV
         ↓
 历史技术因子 / 市场因子 / 截面因子 / 时间因子
         ↓
-Bar Encoder + Factor Encoder
-        ↓
-Gated / FiLM Fusion
+(A) 深度学习路线：Bar Encoder + Feature Encoder -> Gated / FiLM Fusion
+(B) Tabular路线：提取最新截面因子 -> LightGBM 树模型
         ↓
 Return Head + Position Head
         ↓
@@ -78,7 +76,8 @@ long-only target position in [0, 1]
 PnL / turnover / drawdown / cost sensitivity
 ```
 
-这里的 `TCN` 指 Temporal Convolutional Network，用一维因果卷积读取过去 `lookback` 根 K 线序列。它比简单 MLP 更适合处理时间序列，又比 Transformer 更轻，适合当前阶段快速实验。
+这里的 `TCN` 指 Temporal Convolutional Network，用一维因果卷积读取过去 `lookback` 根 K 线序列。
+这里的 `LightGBM` 用于针对性解决 TCN 频繁抖动换仓的问题，直接在截面上寻找胜率更高的买入点。
 
 `Gated / FiLM Fusion` 是把 K 线序列表示和外生因子表示融合的方法：
 
@@ -95,7 +94,7 @@ PnL / turnover / drawdown / cost sensitivity
 - `*-USDT` 现货交易对。
 - long-only 现货仓位，仓位范围 `0..1`。
 - 1min K 线数据。
-- 策略 horizon 可配置为 5m、15m、30m 或其他分钟级 horizon。
+- 策略 horizon 可配置为 5m, 15m, 30m, 60m (1h), 240m (4h), 1440m (1d)。
 - 固定费率和固定滑点的回测配置。
 
 当前版本不覆盖：
@@ -126,7 +125,8 @@ next_equity = cash + sum(target_value_i * (1 + simple_return_i,t))
 portfolio_log_return = log(next_equity / previous_equity)
 ```
 
-成本与目标金额联立求解以保证自融资，现金不得为负。模型策略每分钟再平衡；
+成本与目标金额联立求解以保证自融资，现金不得为负。普通阈值策略每分钟再平衡；
+低换手策略直接使用组合权重，仅在配置的再平衡时点交易，其余时间持有单位不变。
 买入持有基准仅在起点等权买入，之后权重随价格漂移。期末按市值计价，不假设卖出。
 回撤包含初始净值 1。不能平均资产对数收益来代替组合收益。
 
@@ -147,6 +147,9 @@ label_h = log(open_{t+h+1} / open_{t+1})
 | 理解完整 PnL-first 架构 | [docs/SUPERPNL_DESIGN_SPEC.md](docs/SUPERPNL_DESIGN_SPEC.md) |
 | 查看特征 schema 和泄漏判断 | [docs/FEATURE_SCHEMA.md](docs/FEATURE_SCHEMA.md) |
 | 理解回测指标、baseline 和评测计划 | [docs/BACKTEST_AND_EVALUATION_PLAN.md](docs/BACKTEST_AND_EVALUATION_PLAN.md) |
+| 查看下一轮因子优化计划 | [docs/FACTOR_OPTIMIZATION_PLAN.md](docs/FACTOR_OPTIMIZATION_PLAN.md) |
+| 查看 1h / 4h / 1d 长周期实验 | [docs/LONG_HORIZON_EXPERIMENT_REPORT.md](docs/LONG_HORIZON_EXPERIMENT_REPORT.md) |
+| 查看 LightGBM 截面排序实验 | [docs/LIGHTGBM_RANKING_EXPERIMENT_REPORT.md](docs/LIGHTGBM_RANKING_EXPERIMENT_REPORT.md) |
 | 理解下游策略如何使用模型输出 | [docs/DOWNSTREAM_USAGE.md](docs/DOWNSTREAM_USAGE.md) |
 | 查看 Top20 / 12 个月实验报告 | [docs/TOP20_12M_EXPERIMENT_REPORT.md](docs/TOP20_12M_EXPERIMENT_REPORT.md) |
 | 复现实验和理解 Top20 币池 | [docs/REPRODUCIBILITY_AND_TOP20_UNIVERSE.md](docs/REPRODUCIBILITY_AND_TOP20_UNIVERSE.md) |
@@ -231,6 +234,15 @@ hour_sin, hour_cos
 dayofweek_sin, dayofweek_cos
 ```
 
+默认 `factor_set=base` 会保持上述旧特征，保证历史实验可复现。下一轮优化可使用：
+
+```text
+factor_set = expanded
+feature_windows = 5,15,30,60,240,1440
+```
+
+`expanded` 会额外加入多周期 trend/reversal、成交额和 Amihud 流动性、下行波动、K 线 range、跳变强度、BTC/ETH beta 与残差强弱、市场宽度和市场离散度。它们都来自当前及过去 OHLCV 或同一时刻截面数据；本身不引入未来信息。主要泄漏风险是用未来成交额、未来上市状态或测试期结果筛选 universe/参数。
+
 `5m/15m/30m` 是真实时间窗口，不是数据粒度。当前只下载 1min K 线，所以：
 
 ```text
@@ -268,6 +280,16 @@ model = full_feature_tcn
 horizon = 15m
 lookback = 256
 feature_windows = 5,15,30
+```
+
+下一轮因子优化建议：
+
+```text
+model = full_feature_tcn
+horizon = 15m
+factor_set = expanded
+feature_windows = 5,15,30,60,240,1440
+low_turnover_backtest = true
 ```
 
 当前不推荐：
@@ -425,7 +447,42 @@ PYTHONPATH=src python3 scripts/plot_horizon_comparison.py
 docs/charts/superpnl_horizon_comparison.png
 ```
 
-### 7. 打包实时推理模型
+### 7. 运行 expanded 因子 + 低换手回测
+
+这个实验用于验证多周期趋势、流动性、波动/跳变和残差强弱是否能改善含成本 PnL。建议先用 Top20 或 Top50，不要一开始直接 Top100 全量长窗口。
+
+```bash
+PYTHONPATH=src python3 scripts/run_superpnl_experiment.py \
+  --raw-dir data/okx_spot_1m_top20_365d \
+  --cache-dir data/cache/okx_spot_1m_top20_365d_l256_h15_expanded \
+  --out-dir outputs/superpnl_top20_365d_l256_h15_expanded_lowturnover \
+  --lookback 256 \
+  --horizons 15 \
+  --feature-windows 5,15,30,60,240,1440 \
+  --factor-set expanded \
+  --epochs 3 \
+  --samples-per-epoch 200000 \
+  --batch-size 512 \
+  --hidden-dim 96 \
+  --validation-samples 100000 \
+  --threshold-bps 10 \
+  --fixed-fee-bps 8 \
+  --fixed-slippage-bps 0 \
+  --low-turnover-backtest \
+  --low-turnover-top-k 3 \
+  --rebalance-interval-bars 15 \
+  --min-holding-bars 30 \
+  --cooldown-bars 30 \
+  --max-position-per-symbol 0.2 \
+  --max-total-position 0.6 \
+  --min-liquidity-rank -0.2 \
+  --max-illiquidity-rank 0.2 \
+  --rebuild-cache
+```
+
+注意：这条命令里的低换手参数只是起点。正式结论必须先在 validation split 搜索参数，再对 test split 只报告一次，不能用 test 反复调参。
+
+### 8. 打包实时推理模型
 
 ```bash
 PYTHONPATH=src python3 scripts/package_superpnl_model.py --force
@@ -495,6 +552,7 @@ cost_threshold_sensitivity.json
 - 做仓位平滑，例如目标仓位从 0 到 1 分多步调整。
 - 限制单 symbol 最大权重，特别是高波动小币。
 - 用真实 maker/taker 费率和滑点重新回测。
+- 如果使用 `expanded` 因子，优先把 `cross_section_amount_rank` 和 `cross_section_amihud_rank` 作为交易过滤，不要直接放大低流动性币仓位。
 
 一个更合理的下游流程：
 
@@ -522,7 +580,7 @@ docs/BITPRO_STRATEGY_PROMPT.md
 
 ## 成本与流动性说明
 
-当前用户交易量很小，因此第一版没有把盘口、成本、流动性作为模型输入特征。它们只作为回测配置或后续扩展项。
+当前用户交易量很小，因此第一版没有把盘口和真实执行成本作为模型输入特征。`expanded` 中的流动性字段来自历史 OHLCV，优先用于过滤和仓位缩放；真实盘口、滑点和容量仍只作为回测或后续扩展项。
 
 当前暂不进入训练的字段包括：
 
@@ -561,7 +619,7 @@ lookback、分区、来源及标准化参数；不能用旧权重搭配新缓存
 
 ```bash
 python3 -m pip install -e '.[test]'
-OMP_NUM_THREADS=1 python3 -m pytest -q
+OMP_NUM_THREADS=1 LGB_NUM_THREADS=1 python3 -m pytest -q
 ```
 
 分币统计使用 `pnl_contribution`（初始总资金比例，含成本），合计等于组合总收益；
@@ -597,6 +655,7 @@ SuperPnL/
 │   ├── SUPERPNL_DESIGN_SPEC.md
 │   ├── FEATURE_SCHEMA.md
 │   ├── BACKTEST_AND_EVALUATION_PLAN.md
+│   ├── FACTOR_OPTIMIZATION_PLAN.md
 │   ├── DOWNSTREAM_USAGE.md
 │   ├── TOP20_12M_EXPERIMENT_REPORT.md
 │   ├── REPRODUCIBILITY_AND_TOP20_UNIVERSE.md
@@ -624,11 +683,18 @@ SuperPnL/
 
 当前最有价值的迭代顺序：
 
-1. 在 validation split 上搜索 `threshold_bps`、top-k、最短持仓时间和冷却时间。
-2. 把 `pred_ret > 0` 的二值翻仓改成平滑仓位。
-3. 在 loss 或 label 中加入交易成本和 turnover penalty。
-4. 降低对 ZKJ/BIO 等小币的收益集中度。
-5. 重新下载新的 out-of-sample 时间段验证 15m 是否仍有效。
-6. 再决定是否加入盘口、成本和流动性特征。
+1. 用 `factor_set=expanded` 重训 15m，并启用低换手回测。
+2. 在 validation split 上搜索 `threshold_bps`、top-k、最短持仓时间、冷却时间和流动性过滤。
+3. 把 `pred_ret > 0` 的二值翻仓改成平滑仓位。
+4. 在 loss 或 label 中加入交易成本和 turnover penalty。
+5. 降低对 ZKJ/BIO 等小币的收益集中度。
+6. 重新下载新的 out-of-sample 时间段验证 15m 是否仍有效。
+7. 再决定是否加入盘口、真实滑点和容量特征。
 
 在这些步骤完成前，SuperPnL 更适合作为研究信号和策略原型，不应直接作为实盘交易系统使用。
+
+
+LightGBM 权重独立保存为文本模型和 metadata，并绑定训练数据契约；TCN 打包器不用于
+LightGBM。供参数筛选的预测 NPZ 必须携带相同数据契约，旧预测文件需要重新生成。
+低换手回测的 gross_total_return 是相同交易目标/时点下零费用账本收益；
+cost_return 是实际费用占初始本金的比例，不能直接以毛净收益差替代。
